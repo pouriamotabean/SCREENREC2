@@ -1,0 +1,50 @@
+name: Build ScreenRec
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Bundle FFmpeg into the VST3
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $urls = @(
+            'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip',
+            'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip'
+          )
+          $ok = $false
+          foreach ($u in $urls) {
+            try { Invoke-WebRequest -Uri $u -OutFile ffmpeg.zip -UseBasicParsing; $ok = $true; break }
+            catch { Write-Host "download failed: $u" }
+          }
+          if (-not $ok) { throw 'FFmpeg download failed' }
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_x -Force
+          $exe = Get-ChildItem ffmpeg_x -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          $res = 'build/ScreenRec_artefacts/Release/VST3/ScreenRec.vst3/Contents/Resources'
+          New-Item -ItemType Directory -Force -Path $res | Out-Null
+          Copy-Item $exe.FullName "$res/ffmpeg.exe"
+          & "$res/ffmpeg.exe" -hide_banner -encoders | Select-String 'nvenc|amf|qsv|libx264'
+
+      - name: Stage plugin only
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item -Recurse 'build/ScreenRec_artefacts/Release/VST3/ScreenRec.vst3' 'dist/ScreenRec.vst3'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScreenRec-VST3
+          path: dist/
