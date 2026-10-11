@@ -111,6 +111,44 @@ namespace
     };
 }
 
+namespace
+{
+    // Anti-aliased amber ring (+ soft fill) blended into a top-down BGRA image.
+    void drawRipple (uint8_t* bits, int w, int h, double cx, double cy, double radius, double thickness,
+                     double ringAlpha, double fillAlpha)
+    {
+        const double outer = radius + thickness;
+        const int x0 = std::max (0, (int) std::floor (cx - outer - 1)), x1 = std::min (w - 1, (int) std::ceil (cx + outer + 1));
+        const int y0 = std::max (0, (int) std::floor (cy - outer - 1)), y1 = std::min (h - 1, (int) std::ceil (cy + outer + 1));
+        const double cr = 242, cg = 178, cb = 74;   // amber
+
+        for (int y = y0; y <= y1; ++y)
+        {
+            uint8_t* row = bits + (size_t) y * w * 4;
+            for (int x = x0; x <= x1; ++x)
+            {
+                const double d = std::hypot (x + 0.5 - cx, y + 0.5 - cy);
+                double a = 0.0;
+
+                const double ringDist = std::abs (d - radius) - thickness * 0.5;
+                if (ringDist < 1.0)
+                    a = ringAlpha * std::clamp (1.0 - ringDist, 0.0, 1.0);
+
+                if (d < radius)
+                    a = std::max (a, fillAlpha * std::clamp (radius - d, 0.0, 1.0));
+
+                if (a <= 0.0)
+                    continue;
+
+                uint8_t* px = row + x * 4;
+                px[0] = (uint8_t) (px[0] + (cb - px[0]) * a);
+                px[1] = (uint8_t) (px[1] + (cg - px[1]) * a);
+                px[2] = (uint8_t) (px[2] + (cr - px[2]) * a);
+            }
+        }
+    }
+}
+
 ScreenCapture::~ScreenCapture()
 {
     if (running.load())
@@ -298,6 +336,12 @@ void ScreenCapture::captureLoop()
     float lastProbe = 0.0f;
 
     auto frameTime = [&] (int64_t t0, int64_t n) { return t0 + (int64_t) ((double) n * (double) freq / fps); };
+    auto pausedSoFar = [&]() -> int64_t { return pauseTotal != nullptr ? pauseTotal->load() : 0; };
+    auto isPaused = [&]() { return pauseFlag != nullptr && pauseFlag->load(); };
+
+    struct Click { double x, y; int64_t frame; };
+    std::vector<Click> clicks;
+    bool buttonWasDown = false;
 
     const int64_t t0 = startTicks.load();
     int64_t n = 0;
@@ -322,11 +366,19 @@ void ScreenCapture::captureLoop()
 
     while (running.load())
     {
-        Timing::sleepUntil (frameTime (t0, n));
+        if (isPaused())
+        {
+            std::this_thread::sleep_for (std::chrono::milliseconds (5));
+            continue;
+        }
+
+        Timing::sleepUntil (frameTime (t0, n) + pausedSoFar());
+        if (isPaused())
+            continue;
 
         // If we fell behind, repeat the last image for every missed slot so
-        // the file stays locked to the clock.
-        const int64_t current = (int64_t) std::floor ((double) (Timing::now() - t0) * fps / (double) freq);
+        // the file stays locked to the clock (paused time does not count).
+        const int64_t current = (int64_t) std::floor ((double) (Timing::now() - pausedSoFar() - t0) * fps / (double) freq);
         while (n < current)
         {
             pushItem (-1);
@@ -357,6 +409,40 @@ void ScreenCapture::captureLoop()
             else
             {
                 BitBlt (out.dc, 0, 0, outW, outH, screen, 0, 0, SRCCOPY | CAPTUREBLT);
+            }
+
+            // Click highlight: amber ripple where the mouse was pressed.
+            if (clickEnabled != nullptr && clickEnabled->load())
+            {
+                const bool down = (GetAsyncKeyState (VK_LBUTTON) & 0x8000) != 0 || (GetAsyncKeyState (VK_RBUTTON) & 0x8000) != 0;
+                if (down && ! buttonWasDown)
+                {
+                    POINT p {};
+                    if (GetCursorPos (&p))
+                        clicks.push_back ({ (double) p.x, (double) p.y, n });
+                }
+                buttonWasDown = down;
+
+                constexpr int life = 14;   // frames (~0.45 s)
+                clicks.erase (std::remove_if (clicks.begin(), clicks.end(), [&] (const Click& c) { return n - c.frame >= life; }), clicks.end());
+
+                if (! clicks.empty())
+                {
+                    GdiFlush();
+                    const double k = (double) std::min (outW, outH) / 1080.0;
+                    for (auto& c : clicks)
+                    {
+                        const double t = (double) (n - c.frame) / life;
+                        const double ox = (c.x - rx) * sx, oy = (c.y - ry) * sy;
+                        drawRipple (out.bits, outW, outH, ox, oy, (12.0 + 30.0 * t) * k, 3.0 * k,
+                                    0.9 * std::pow (1.0 - t, 1.4), 0.28 * (1.0 - t));
+                    }
+                }
+            }
+            else
+            {
+                clicks.clear();
+                buttonWasDown = false;
             }
 
             CURSORINFO ci {};

@@ -31,6 +31,26 @@ public:
     // probeRect: physical screen pixels of the sync-test flash panel (test only).
     void start (bool syncTest, juce::Rectangle<int> probeRect = {}, bool micTest = false);
     void stop();
+
+    // Pause / resume a normal recording. Paused time is left out of the file.
+    void togglePause();
+    bool isPaused() const           { return paused.load(); }
+
+    // 3-2-1 before a normal recording starts (0 when not counting down).
+    int getCountdown() const;
+
+    // Music ducking under the narration (video only) and click highlight.
+    bool isDuckEnabled() const      { return duckEnabled.load(); }
+    void setDuckEnabled (bool v)    { duckEnabled = v; saveSettings(); }
+    bool isClickEnabled() const     { return clickEnabled.load(); }
+    void setClickEnabled (bool v)   { clickEnabled = v; saveSettings(); }
+
+    // Open Explorer at the last saved file (or the output folder).
+    void revealLastOutput() const;
+    bool hasLastOutput() const;
+
+    // Finds a recording left unfinished by a crash and turns it into an MP4.
+    void checkForRecovery();
     void warmUp();      // probe the GPU encoder in the background (call when the editor opens)
 
     State getState() const          { return state.load(); }
@@ -114,7 +134,11 @@ private:
     bool renderAlignedAudio (const juce::File& rawWav, const juce::File& outWav,
                              int64_t videoStartTicks, int64_t frameCount,
                              int firstChannel, double timeShift);
-    bool mixWavFiles (const juce::File& a, const juce::File& b, const juce::File& out);
+    bool mixWavFiles (const juce::File& a, const juce::File& b, const juce::File& out, bool duck);
+    void produceOutput (int64_t t0, int64_t frames, const std::vector<float>& probe, bool recovered);
+    void runRecovery (juce::File dir);
+    void writeSessionInfo();
+    static bool repairWavHeader (const juce::File& wav);
     double analyseSyncTest (const juce::File& alignedWav, const std::vector<float>& probe, int& pairsFound);
 
     void loadSettings();
@@ -128,6 +152,15 @@ private:
     std::atomic<double> micOffsetMs { 0.0 };
     std::atomic<int> quality { 2 };          // 0 = 480, 1 = 720, 2 = 1080, 3 = 4K
     std::atomic<bool> frameVisible { true };
+    std::atomic<bool> paused { false };
+    std::atomic<int64_t> pauseStartTicks { 0 };
+    std::atomic<int64_t> pausedTotalTicks { 0 };
+    std::atomic<int64_t> countdownEnd { 0 };
+    std::atomic<bool> duckEnabled { true };
+    std::atomic<bool> clickEnabled { true };
+    juce::String lastOutputPath;              // guarded by textLock
+    std::unique_ptr<juce::FileOutputStream> stampsOut;
+    int framesFileCounter = 0;
     std::atomic<bool> audioActive { false };       // audio thread pushes while true
     std::atomic<double> syncOffsetMs { 0.0 };
     std::atomic<int> mode { 0 };

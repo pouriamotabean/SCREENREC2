@@ -37,7 +37,8 @@ private:
         }
     };
 
-    enum Area { aRec, aYoutube, aReels, aFrame, aQ480, aQ720, aQ1080, aQ4k, aMicTest, aSyncTest, aKnob, aCount };
+    enum Area { aRec, aYoutube, aReels, aFrame, aQ480, aQ720, aQ1080, aQ4k, aMicTest, aSyncTest, aKnob,
+                aPause, aDuck, aClicks, aStatus, aCount };
     int areaAt (juce::Point<float> skinPos) const;
     juce::Point<float> toSkin (juce::Point<float> p) const  { return p / scale; }
 

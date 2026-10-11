@@ -188,13 +188,17 @@ void Recorder::processAudio (juce::AudioBuffer<float>& buffer, const juce::Audio
         }
     }
 
+    // ---- paused: nothing goes into the file
+    if (paused.load (std::memory_order_acquire))
+        return;
+
     // ---- tap: exactly what goes to the speakers/headphones
     if (stampFifo != nullptr && stampFifo->getFreeSpace() > 0)
     {
         int s1, n1, s2, n2;
         stampFifo->prepareToWrite (1, s1, n1, s2, n2);
         if (n1 > 0)
-            stampFifoData[(size_t) s1] = { samplesPushed, now };
+            stampFifoData[(size_t) s1] = { samplesPushed, now - pausedTotalTicks.load (std::memory_order_acquire) };
         stampFifo->finishedWrite (n1 + n2);
     }
 
@@ -262,7 +266,10 @@ void Recorder::start (bool syncTest, juce::Rectangle<int> probeRect, bool micTes
     syncTestMode = syncTest && ! micTest;
     micTestMode = micTest;
     stopRequested = false;
-    setStatus (micTest ? "Mic test: starting..." : (syncTest ? "Sync test: starting..." : "Starting..."));
+    paused = false;
+    pausedTotalTicks = 0;
+    countdownEnd = (syncTest || micTest) ? 0 : Timing::now() + Timing::fromSeconds (3.0);
+    setStatus (micTest ? "Mic test: starting..." : (syncTest ? "Sync test: starting..." : "Get ready..."));
 
     workerBusy = true;
     worker = std::thread ([this, syncTest, probeRect, micTest]
@@ -298,7 +305,68 @@ double Recorder::getElapsedSeconds() const
     if (state.load() != State::recording)
         return 0.0;
 
-    return juce::jmax (0.0, Timing::toSeconds (Timing::now() - captureStartTicks.load()));
+    const int64_t now = Timing::now();
+    int64_t pausedNow = pausedTotalTicks.load();
+    if (paused.load())
+        pausedNow += now - pauseStartTicks.load();
+
+    return juce::jmax (0.0, Timing::toSeconds (now - captureStartTicks.load() - pausedNow));
+}
+
+int Recorder::getCountdown() const
+{
+    if (state.load() != State::starting)
+        return 0;
+
+    const int64_t end = countdownEnd.load();
+    if (end == 0)
+        return 0;
+
+    const double left = Timing::toSeconds (end - Timing::now());
+    return left > 0.0 ? (int) std::ceil (left) : 0;
+}
+
+void Recorder::togglePause()
+{
+    if (state.load() != State::recording || syncTestMode.load() || micTestMode.load())
+        return;
+
+    if (! paused.load())
+    {
+        pauseStartTicks = Timing::now();
+        paused.store (true, std::memory_order_release);
+        setStatus ("Paused");
+    }
+    else
+    {
+        pausedTotalTicks += Timing::now() - pauseStartTicks.load();   // before clearing the flag
+        paused.store (false, std::memory_order_release);
+        setStatus ("Recording  -  " + getEncoderName());
+    }
+}
+
+bool Recorder::hasLastOutput() const
+{
+    std::lock_guard<std::mutex> g (textLock);
+    return lastOutputPath.isNotEmpty() && juce::File (lastOutputPath).existsAsFile();
+}
+
+void Recorder::revealLastOutput() const
+{
+    juce::String path;
+    {
+        std::lock_guard<std::mutex> g (textLock);
+        path = lastOutputPath;
+    }
+
+    const juce::File f (path);
+    if (path.isNotEmpty() && f.existsAsFile())
+        f.revealToUser();
+    else
+    {
+        getOutputFolder().createDirectory();
+        getOutputFolder().startAsProcess();
+    }
 }
 
 bool Recorder::isFlashOn() const
@@ -510,6 +578,9 @@ void Recorder::runStart (bool syncTest, juce::Rectangle<int> probeRect, bool mic
 
     capture = std::make_unique<ScreenCapture>();
     capture->setRegionSource (frames[(int) m]);
+    capture->setPauseSource (&paused, &pausedTotalTicks);
+    if (! syncTest)
+        capture->setClickSource (&clickEnabled);
     if (! (syncTest ? capture->openFullScreen()
                     : capture->open (aspectOf (m), outW, outH)))
     {
@@ -526,6 +597,24 @@ void Recorder::runStart (bool syncTest, juce::Rectangle<int> probeRect, bool mic
         capture->setProbeRect (probeRect.getX(), probeRect.getY(), probeRect.getWidth(), probeRect.getHeight());
         log ("probe rect (physical px): " + probeRect.toString());
     }
+
+    // ---- 3-2-1 (normal recordings); STOP during the countdown cancels
+    while (countdownEnd.load() != 0 && Timing::now() < countdownEnd.load())
+    {
+        if (stopRequested.load())
+        {
+            capture.reset();
+            sessionTempDir.deleteRecursively();
+            log ("cancelled during countdown");
+            setStatus ("Cancelled");
+            countdownEnd = 0;
+            state = State::idle;
+            anyInstanceBusy = false;
+            return;
+        }
+        std::this_thread::sleep_for (std::chrono::milliseconds (10));
+    }
+    countdownEnd = 0;
 
     // ---- audio side
     sessionSampleRate = currentSampleRate.load();
@@ -557,6 +646,16 @@ void Recorder::runStart (bool syncTest, juce::Rectangle<int> probeRect, bool mic
         return;
     }
     stream.release();   // owned by the writer now
+
+    // Crash safety: block stamps go to disk as they arrive.
+    stampsOut.reset();
+    framesFileCounter = 0;
+    if (! syncTest && ! micTest)
+    {
+        stampsOut = std::make_unique<juce::FileOutputStream> (sessionTempDir.getChildFile ("stamps.bin"));
+        if (! stampsOut->openedOk())
+            stampsOut.reset();
+    }
 
     drainRunning = true;
     drainThread = std::thread ([this] { drainLoop(); });
@@ -596,6 +695,9 @@ void Recorder::runStart (bool syncTest, juce::Rectangle<int> probeRect, bool mic
     captureStartTicks = capture->getStartTicks();
     testFirstFlash = captureStartTicks.load() + Timing::fromSeconds (1.5);
 
+    if (! syncTest)
+        writeSessionInfo();
+
     state = State::recording;
     setStatus (syncTest ? "Sync test: keep this window visible, transport stopped"
                         : "Recording  -  " + enc);
@@ -609,6 +711,14 @@ void Recorder::drainLoop()
     while (drainRunning.load())
     {
         drainOnce();
+
+        if (stampsOut != nullptr && ++framesFileCounter >= 50)   // ~1 s
+        {
+            framesFileCounter = 0;
+            if (capture != nullptr)
+                sessionTempDir.getChildFile ("frames.txt").replaceWithText (juce::String (capture->getFrameCount()));
+        }
+
         std::this_thread::sleep_for (std::chrono::milliseconds (20));
     }
 }
@@ -651,9 +761,16 @@ void Recorder::drainOnce()
         const int ready = stampFifo->getNumReady();
         int s1, n1, s2, n2;
         stampFifo->prepareToRead (ready, s1, n1, s2, n2);
+        const size_t first = stamps.size();
         for (int i = 0; i < n1; ++i) stamps.push_back (stampFifoData[(size_t) (s1 + i)]);
         for (int i = 0; i < n2; ++i) stamps.push_back (stampFifoData[(size_t) (s2 + i)]);
         stampFifo->finishedRead (n1 + n2);
+
+        if (stampsOut != nullptr && stamps.size() > first)
+        {
+            stampsOut->write (stamps.data() + first, (stamps.size() - first) * sizeof (BlockStamp));
+            stampsOut->flush();
+        }
     }
 }
 
@@ -684,11 +801,18 @@ void Recorder::runFinish()
         drainThread.join();
     drainOnce();
     rawWriter.reset();
+    stampsOut.reset();
+    paused = false;
 
     std::vector<float> probe;
     if (capture != nullptr)
         probe = capture->getProbeSamples();
 
+    produceOutput (t0, frames, probe, false);
+}
+
+void Recorder::produceOutput (int64_t t0, int64_t frames, const std::vector<float>& probe, bool recovered)
+{
     const auto videoFile = sessionTempDir.getChildFile ("video.mkv");
 
     if (frames <= 0 || ! videoFile.existsAsFile() || videoFile.getSize() == 0)
@@ -722,7 +846,7 @@ void Recorder::runFinish()
         aligned = sessionTempDir.getChildFile ("audio_aligned.wav");
 
         if (! renderAlignedAudio (rawAudio, alignedMic, t0, frames, 2, -blockTime + micOffsetMs.load() / 1000.0)
-            || ! mixWavFiles (alignedMaster, alignedMic, aligned))
+            || ! mixWavFiles (alignedMaster, alignedMic, aligned, duckEnabled.load()))
         {
             fail ("Mic alignment failed - see log");
             return;
@@ -763,12 +887,15 @@ void Recorder::runFinish()
                              "-c:v", "copy", "-c:a", "aac", "-b:a", "320k" };
     if (sr != 44100 && sr != 48000)
         args.addArray ({ "-ar", "48000" });
+    if (recovered)
+        args.add ("-shortest");
     args.addArray ({ "-movflags", "+faststart", sessionOutput.getFullPathName() });
 
     const int code = runProcessAndWait (buildCommand (args), toWide (sessionLog.getFullPathName()), 60 * 60 * 1000);
 
     if (code != 0 || ! sessionOutput.existsAsFile())
     {
+        sessionTempDir.getChildFile ("recovery_failed").create();   // never retried automatically
         fail ("Final MP4 failed (ffmpeg code " + juce::String (code) + ") - temp files kept, see log");
         return;
     }
@@ -781,7 +908,13 @@ void Recorder::runFinish()
     stampFifo.reset();
 
     if (resultText.isEmpty())
-        resultText = "Saved " + sessionOutput.getFileName();
+        resultText = (recovered ? "Recovered " : "Saved ") + sessionOutput.getFileName() + "  (click to open)";
+
+    if (! syncTestMode.load())
+    {
+        std::lock_guard<std::mutex> g (textLock);
+        lastOutputPath = sessionOutput.getFullPathName();
+    }
 
     setStatus (resultText);
     state = State::idle;
@@ -1095,6 +1228,8 @@ void Recorder::loadSettings()
         if (key == "quality") quality = juce::jlimit (0, 3, val.getIntValue());
         if (key == "show_frame") frameVisible = val.getIntValue() != 0;
         if (key == "mic_gain_db") setMicGainDb ((float) val.getDoubleValue());
+        if (key == "duck") duckEnabled = val.getIntValue() != 0;
+        if (key == "clicks") clickEnabled = val.getIntValue() != 0;
         if (key == "ui_width") uiWidth = juce::jlimit (480, 960, val.getIntValue());
 
         for (int m = 0; m < 2; ++m)
@@ -1119,6 +1254,8 @@ void Recorder::saveSettings()
       << "quality=" << quality.load() << "\r\n"
       << "show_frame=" << (frameVisible.load() ? 1 : 0) << "\r\n"
       << "mic_gain_db=" << juce::String (micGainDb.load(), 1) << "\r\n"
+      << "duck=" << (duckEnabled.load() ? 1 : 0) << "\r\n"
+      << "clicks=" << (clickEnabled.load() ? 1 : 0) << "\r\n"
       << "ui_width=" << uiWidth.load() << "\r\n";
 
     for (int m = 0; m < 2; ++m)
@@ -1134,7 +1271,7 @@ void Recorder::saveSettings()
 
 //==============================================================================
 
-bool Recorder::mixWavFiles (const juce::File& a, const juce::File& b, const juce::File& out)
+bool Recorder::mixWavFiles (const juce::File& a, const juce::File& b, const juce::File& out, bool duck)
 {
     juce::AudioFormatManager fm;
     fm.registerBasicFormats();
@@ -1156,12 +1293,49 @@ bool Recorder::mixWavFiles (const juce::File& a, const juce::File& b, const juce
     const int64_t len = juce::jmax (ra->lengthInSamples, rb->lengthInSamples);
     juce::AudioBuffer<float> ba (2, 16384), bb (2, 16384);
 
+    // Ducking: while the voice is present the music drops by 8 dB
+    // (fast down, holds 250 ms, comes back over ~0.5 s). Video only.
+    const double sr = ra->sampleRate > 0 ? ra->sampleRate : 48000.0;
+    const float duckGain = juce::Decibels::decibelsToGain (-8.0f);
+    const float threshold = juce::Decibels::decibelsToGain (-40.0f);
+    const float envAttack  = (float) (1.0 - std::exp (-1.0 / (0.005 * sr)));
+    const float envRelease = (float) (1.0 - std::exp (-1.0 / (0.150 * sr)));
+    const float gDown = (float) (1.0 - std::exp (-1.0 / (0.060 * sr)));
+    const float gUp   = (float) (1.0 - std::exp (-1.0 / (0.500 * sr)));
+    const int holdSamples = (int) (0.25 * sr);
+    float env = 0.0f, gain = 1.0f;
+    int hold = 0;
+
     for (int64_t pos = 0; pos < len; pos += 16384)
     {
         const int n = (int) juce::jmin<int64_t> (16384, len - pos);
         ba.clear(); bb.clear();
         ra->read (&ba, 0, n, pos, true, true);
         rb->read (&bb, 0, n, pos, true, true);
+
+        if (duck)
+        {
+            float* l = ba.getWritePointer (0);
+            float* r = ba.getWritePointer (1);
+            const float* ml = bb.getReadPointer (0);
+            const float* mr = bb.getReadPointer (1);
+
+            for (int i = 0; i < n; ++i)
+            {
+                const float x = juce::jmax (std::abs (ml[i]), std::abs (mr[i]));
+                env += (x - env) * (x > env ? envAttack : envRelease);
+
+                if (env > threshold) hold = holdSamples;
+                else if (hold > 0)   --hold;
+
+                const float target = hold > 0 ? duckGain : 1.0f;
+                gain += (target - gain) * (target < gain ? gDown : gUp);
+
+                l[i] *= gain;
+                r[i] *= gain;
+            }
+        }
+
         for (int ch = 0; ch < 2; ++ch)
             ba.addFrom (ch, 0, bb, ch, 0, n);
         w->writeFromAudioSampleBuffer (ba, 0, n);
@@ -1365,4 +1539,182 @@ double Recorder::analyseMicTest (const juce::File& masterWav, const juce::File& 
 
     pairsFound = (int) matched.size();
     return -median (matched);   // mic is late by median -> move it earlier
+}
+
+//==============================================================================
+// Crash recovery
+//
+// While recording, the temp folder holds everything needed to finish the file
+// later: video.mkv (ffmpeg closes it cleanly when our process dies), the raw
+// 4-channel WAV (its header is repaired), the block stamps and session.txt.
+
+void Recorder::writeSessionInfo()
+{
+    juce::String t;
+    t << "version=1\r\n"
+      << "sample_rate=" << juce::String (sessionSampleRate, 3) << "\r\n"
+      << "block_size=" << sessionBlockSize << "\r\n"
+      << "t0=" << juce::String ((juce::int64) captureStartTicks.load()) << "\r\n"
+      << "output=" << sessionOutput.getFullPathName() << "\r\n";
+    sessionTempDir.getChildFile ("session.txt").replaceWithText (t);
+}
+
+bool Recorder::repairWavHeader (const juce::File& wav)
+{
+    const juce::int64 fileSize = wav.getSize();
+    if (fileSize < 64)
+        return false;
+
+    juce::MemoryBlock head;
+    {
+        juce::FileInputStream in (wav);
+        if (! in.openedOk())
+            return false;
+        in.readIntoMemoryBlock (head, juce::jmin<juce::int64> (fileSize, 65536));
+    }
+
+    auto* d = static_cast<const char*> (head.getData());
+    if (head.getSize() < 12 || std::memcmp (d, "RIFF", 4) != 0 || std::memcmp (d + 8, "WAVE", 4) != 0)
+        return false;
+
+    size_t pos = 12;
+    while (pos + 8 <= head.getSize())
+    {
+        const auto chunkSize = (juce::uint32) juce::ByteOrder::littleEndianInt (d + pos + 4);
+
+        if (std::memcmp (d + pos, "data", 4) == 0)
+        {
+            const juce::int64 dataStart = (juce::int64) pos + 8;
+            juce::int64 dataBytes = ((fileSize - dataStart) / 16) * 16;   // 4 ch x 32-bit float
+            dataBytes = juce::jmin<juce::int64> (dataBytes, 0xFFFFFF00LL);
+
+            juce::FileOutputStream out (wav);
+            if (! out.openedOk())
+                return false;
+
+            out.setPosition (4);
+            out.writeInt ((int) (juce::uint32) juce::jmin<juce::int64> (dataStart + dataBytes - 8, 0xFFFFFFF0LL));
+            out.setPosition ((juce::int64) pos + 4);
+            out.writeInt ((int) (juce::uint32) dataBytes);
+            out.flush();
+            return true;
+        }
+
+        pos += 8 + chunkSize + (chunkSize & 1);
+    }
+
+    return false;
+}
+
+void Recorder::checkForRecovery()
+{
+    if (isBusy())
+        return;
+
+    const auto tempRoot = getOutputFolder().getChildFile (".temp");
+    if (! tempRoot.isDirectory())
+        return;
+
+    for (const auto& entry : juce::RangedDirectoryIterator (tempRoot, false, "*", juce::File::findDirectories))
+    {
+        const auto dir = entry.getFile();
+        const auto video = dir.getChildFile ("video.mkv");
+
+        if (! dir.getChildFile ("session.txt").existsAsFile()
+            || dir.getChildFile ("recovery_failed").existsAsFile()
+            || ! video.existsAsFile()
+            || ! dir.getChildFile ("audio_raw.wav").existsAsFile())
+            continue;
+
+        // ffmpeg may still be finishing the file: wait until it has been quiet for a while.
+        if (juce::Time::getCurrentTime() - video.getLastModificationTime() < juce::RelativeTime::seconds (20))
+            continue;
+
+        bool expected = false;
+        if (! anyInstanceBusy.compare_exchange_strong (expected, true))
+            return;
+
+        joinWorker();
+        state = State::saving;
+        syncTestMode = false;
+        micTestMode = false;
+        setStatus ("Recovering an unfinished recording...");
+
+        workerBusy = true;
+        worker = std::thread ([this, dir]
+        {
+            runRecovery (dir);
+            workerBusy = false;
+        });
+        return;
+    }
+}
+
+void Recorder::runRecovery (juce::File dir)
+{
+    juce::StringPairArray info;
+    {
+        juce::StringArray lines;
+        dir.getChildFile ("session.txt").readLines (lines);
+        for (auto& l : lines)
+            if (l.contains ("="))
+                info.set (l.upToFirstOccurrenceOf ("=", false, false).trim(), l.fromFirstOccurrenceOf ("=", false, false).trim());
+    }
+
+    sessionTempDir = dir;
+    sessionName = dir.getFileName() + "_recovered";
+    sessionOutput = getOutputFolder().getChildFile (sessionName + ".mp4");
+    sessionLog = getOutputFolder().getChildFile ("logs").getChildFile (sessionName + ".log");
+    sessionLog.getParentDirectory().createDirectory();
+    sessionSampleRate = info["sample_rate"].getDoubleValue() > 0 ? info["sample_rate"].getDoubleValue() : 48000.0;
+    sessionBlockSize = juce::jmax (1, info["block_size"].getIntValue());
+    const int64_t t0 = (int64_t) info["t0"].getLargeIntValue();
+
+    log ("recovering " + dir.getFullPathName());
+
+    // block stamps
+    stamps.clear();
+    {
+        juce::MemoryBlock mb;
+        dir.getChildFile ("stamps.bin").loadFileAsData (mb);
+        const size_t n = mb.getSize() / sizeof (BlockStamp);
+        stamps.resize (n);
+        if (n > 0)
+            std::memcpy (stamps.data(), mb.getData(), n * sizeof (BlockStamp));
+    }
+
+    const bool wavOk = repairWavHeader (dir.getChildFile ("audio_raw.wav"));
+
+    // video length: from frames.txt, else from the last audio stamp
+    int64_t frames = (int64_t) dir.getChildFile ("frames.txt").loadFileAsString().trim().getLargeIntValue();
+    if (frames <= 0 && ! stamps.empty())
+        frames = (int64_t) (Timing::toSeconds (stamps.back().ticks - t0) * ScreenCapture::fps);
+
+    log ("stamps " + juce::String ((int) stamps.size()) + ", frames ~" + juce::String (frames) + (wavOk ? "" : ", WAV header not repaired"));
+
+    // mic peak: scan the mic channels so the mic is only mixed when present
+    sessionMicPeak = 0.0f;
+    {
+        juce::AudioFormatManager fm;
+        fm.registerBasicFormats();
+        std::unique_ptr<juce::AudioFormatReader> r (fm.createReaderFor (dir.getChildFile ("audio_raw.wav")));
+        if (r != nullptr && r->numChannels >= 4)
+        {
+            juce::Range<float> lv[4];
+            r->readMaxLevels (0, r->lengthInSamples, lv, 4);
+            sessionMicPeak = juce::jmax (lv[2].getEnd(), -lv[2].getStart(), lv[3].getEnd(), -lv[3].getStart());
+        }
+    }
+
+    if (stamps.empty() || frames <= 0)
+    {
+        dir.getChildFile ("recovery_failed").create();
+        fail ("Could not recover the unfinished recording (files kept in .temp)");
+        return;
+    }
+
+    produceOutput (t0, frames, {}, true);
+
+    if (state.load() == State::error)
+        dir.getChildFile ("recovery_failed").create();
 }

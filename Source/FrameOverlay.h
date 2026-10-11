@@ -20,6 +20,7 @@ private:
     struct FrameWindow : juce::Component
     {
         bool recording = false;
+        int countdown = 0;
         void paint (juce::Graphics&) override;
     };
 
@@ -69,6 +70,7 @@ private:
     juce::Rectangle<int> lastFrameRect;
     bool lastRecording = false;
     int lastMode = -1;
+    int lastQuality = -1;
 
     static constexpr int handleSize = 30;
     static constexpr int border = 4;

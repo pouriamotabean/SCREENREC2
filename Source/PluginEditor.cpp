@@ -80,6 +80,10 @@ ScreenRecEditor::ScreenRecEditor (ScreenRecProcessor& p)
     areas[aMicTest]  = { 1142, 842, 158, 54 };
     areas[aSyncTest] = { 1314, 842, 158, 54 };
     areas[aKnob]     = { knobCentre.x - knobR, knobCentre.y - knobR, knobR * 2, knobR * 2 };
+    areas[aPause]    = { 147, 621, 180, 46 };
+    areas[aDuck]     = { 50, 689, 170, 44 };
+    areas[aClicks]   = { 256, 689, 170, 44 };
+    areas[aStatus]   = { 66, 830, 1012, 82 };
 
     addChildComponent (flash);
     flash.setInterceptsMouseClicks (false, false);
@@ -97,6 +101,8 @@ ScreenRecEditor::ScreenRecEditor (ScreenRecProcessor& p)
     if (processor.overlay == nullptr)
         processor.overlay = std::make_unique<FrameOverlay> (recorder);
     processor.overlay->setEditorOpen (true);
+
+    recorder.checkForRecovery();
 
     startTimerHz (30);
 }
@@ -348,7 +354,10 @@ void ScreenRecEditor::paint (juce::Graphics& g)
         g.setColour (lampOn ? recRed.brighter (0.2f) : juce::Colour (0xff3a1612));
         g.fillEllipse (lamp.x - 9, lamp.y - 9, 18, 18);
 
-        const juce::String label = recording ? (recorder.isMicTest() ? "MIC TEST" : recorder.isSyncTest() ? "SYNC TEST" : "RECORDING")
+        const int countdown = recorder.getCountdown();
+        const bool isPaused = recording && recorder.isPaused();
+        const juce::String label = recording ? (recorder.isMicTest() ? "MIC TEST" : recorder.isSyncTest() ? "SYNC TEST" : isPaused ? "PAUSED" : "RECORDING")
+                                             : countdown > 0 ? "GET READY"
                                              : (busy ? (state == Recorder::State::saving ? "SAVING" : "STARTING") : "READY");
         g.setColour (amberText.withAlpha (recording || busy ? 0.95f : 0.45f));
         g.setFont (sans (22.0f, true, 0.3f));
@@ -360,8 +369,10 @@ void ScreenRecEditor::paint (juce::Graphics& g)
         if (! flash.isVisible())
         {
             const auto tc = juce::Rectangle<float> (displayInner.getX() + 24, displayInner.getY() + 62, displayInner.getWidth() - 40, 100);
-            const auto text = formatTime (recorder.getElapsedSeconds());
-            const float a = recording ? 1.0f : 0.35f;
+            const auto text = countdown > 0 ? juce::String ("- ") + juce::String (countdown) + " -"
+                                            : formatTime (recorder.getElapsedSeconds());
+            const bool blinkOff = isPaused && std::fmod (juce::Time::getMillisecondCounterHiRes() / 1000.0, 1.0) > 0.55;
+            const float a = countdown > 0 ? 1.0f : recording ? (blinkOff ? 0.25f : 1.0f) : 0.35f;
             g.setFont (mono (96.0f, true));
 
             g.setColour (amberText.withAlpha (0.12f * a));          // soft glow
@@ -483,6 +494,16 @@ void ScreenRecEditor::paint (juce::Graphics& g)
         g.drawFittedText (s, statusArea.toNearestInt(), juce::Justification::centredLeft, 2, 0.8f);
     }
 
+    // ---- pause / duck / clicks (left column)
+    {
+        const bool canPause = recording && ! recorder.isMicTest() && ! recorder.isSyncTest();
+        const bool isPaused = recording && recorder.isPaused();
+        const bool blink = isPaused && std::fmod (juce::Time::getMillisecondCounterHiRes() / 1000.0, 1.0) < 0.55;
+        drawMetalButton (g, areas[aPause], isPaused ? "RESUME" : "PAUSE", blink, canPause, hover == aPause);
+        drawMetalButton (g, areas[aDuck], "DUCK", recorder.isDuckEnabled(), true, hover == aDuck);
+        drawMetalButton (g, areas[aClicks], "CLICKS", recorder.isClickEnabled(), true, hover == aClicks);
+    }
+
     // ---- tests
     drawMetalButton (g, areas[aMicTest], "MIC TEST", recorder.isMicTest() && recording, idle, hover == aMicTest);
     drawMetalButton (g, areas[aSyncTest], "SYNC TEST", recorder.isSyncTest() && recording, idle, hover == aSyncTest);
@@ -499,6 +520,7 @@ void ScreenRecEditor::mouseMove (const juce::MouseEvent& e)
         hover = h;
         setMouseCursor (h >= 0 ? (h == aKnob ? juce::MouseCursor::UpDownResizeCursor : juce::MouseCursor::PointingHandCursor)
                                : juce::MouseCursor::NormalCursor);
+
         repaint();
     }
 }
@@ -560,9 +582,15 @@ void ScreenRecEditor::mouseUp (const juce::MouseEvent& e)
     switch (areaAt (toSkin (e.position)))
     {
         case aRec:
-            if (state == Recorder::State::recording)  recorder.stop();
-            else if (idle)                            recorder.start (false);
+            if (state == Recorder::State::recording)       recorder.stop();
+            else if (state == Recorder::State::starting)   recorder.stop();   // cancels the countdown
+            else if (idle)                                 recorder.start (false);
             break;
+
+        case aPause:   recorder.togglePause(); break;
+        case aDuck:    recorder.setDuckEnabled (! recorder.isDuckEnabled()); break;
+        case aClicks:  recorder.setClickEnabled (! recorder.isClickEnabled()); break;
+        case aStatus:  if (state != Recorder::State::saving) recorder.revealLastOutput(); break;
 
         case aSyncTest:
             if (idle)

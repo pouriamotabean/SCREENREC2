@@ -33,6 +33,17 @@ public:
     // Frame mode: three atomics {centreX, centreY, height} as fractions of the
     // screen (x of width, y and height of height). Read every frame.
     void setRegionSource (const std::atomic<double>* cxCyH) { region = cxCyH; }
+
+    // Pause: while *paused is true no frames are produced; *pausedTicks is the
+    // total paused time so far (the file timeline skips it).
+    void setPauseSource (const std::atomic<bool>* paused, const std::atomic<int64_t>* pausedTicks)
+    {
+        pauseFlag = paused;
+        pauseTotal = pausedTicks;
+    }
+
+    // Click highlight in the video (amber ripple), read every frame.
+    void setClickSource (const std::atomic<bool>* enabled)  { clickEnabled = enabled; }
     int getOutputWidth() const   { return outW; }
     int getOutputHeight() const  { return outH; }
     int getNativeWidth() const   { return nativeW; }
@@ -67,6 +78,9 @@ private:
     double aspect = 16.0 / 9.0;
     bool measure();
     const std::atomic<double>* region = nullptr;
+    const std::atomic<bool>* pauseFlag = nullptr;
+    const std::atomic<int64_t>* pauseTotal = nullptr;
+    const std::atomic<bool>* clickEnabled = nullptr;
 
     WinProcess ffmpeg;
     std::thread captureThread, writerThread;

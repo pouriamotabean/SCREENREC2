@@ -54,9 +54,12 @@ double FrameOverlay::minHeightFraction() const
     if (auto* d = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
         physicalH = d->totalArea.getHeight() * d->scale;
 
-    // Smallest frame: a third of the screen height (but at least 540 px),
-    // so the output never gets too soft.
-    return juce::jlimit (0.1, 1.0, juce::jmax (physicalH / 3.0, 540.0) / physicalH);
+    // Smallest frame depends on the output quality: the screen area may be
+    // enlarged at most 2.5x, and never be smaller than 1/7 of the screen.
+    int outW = 1920, outH = 1080;
+    Recorder::outputSize (mode(), recorder.effectiveQuality (mode()), outW, outH);
+    const double minPhysical = juce::jmax ((double) outH / 2.5, physicalH / 7.0);
+    return juce::jlimit (0.05, 1.0, minPhysical / physicalH);
 }
 
 void FrameOverlay::getFrame (double& cx, double& cy, double& h) const
@@ -219,11 +222,23 @@ void FrameOverlay::timerCallback()
         return;
 
     const bool rec = recorder.getState() == Recorder::State::recording;
-    if (rec != lastRecording)
+    const int cd = recorder.getCountdown();
+    if (rec != lastRecording || cd != frame.countdown)
     {
         lastRecording = rec;
         frame.recording = rec;
+        frame.countdown = cd;
         frame.repaint();
+    }
+
+    const int q = recorder.getQuality();
+    if (q != lastQuality)   // a new quality can change the smallest allowed frame
+    {
+        lastQuality = q;
+        double cx, cy, h;
+        getFrame (cx, cy, h);
+        if (h > 0.0)
+            setFrame (cx, cy, h);
     }
 
     if ((int) mode() != lastMode)              // YOUTUBE <-> REELS
@@ -263,8 +278,22 @@ void FrameOverlay::FrameWindow::paint (juce::Graphics& g)
     g.fillRect (o.getX(), o.getBottom() - k, t, k);             g.fillRect (o.getX(), o.getBottom() - t, k, t);
     g.fillRect (o.getRight() - t, o.getBottom() - k, t, k);     g.fillRect (o.getRight() - k, o.getBottom() - t, k, t);
 
-    // Centre marker: soft translucent white circle with a fine crosshair.
     const auto c = inner.getCentre();
+
+    // 3-2-1 before recording (never in the video: this window is excluded)
+    if (countdown > 0)
+    {
+        const float r = 70.0f;
+        g.setColour (juce::Colours::black.withAlpha (0.6f));
+        g.fillEllipse (c.x - r, c.y - r, r * 2.0f, r * 2.0f);
+        g.setColour (amber);
+        g.drawEllipse (c.x - r, c.y - r, r * 2.0f, r * 2.0f, 3.0f);
+        g.setFont (juce::FontOptions (90.0f, juce::Font::bold));
+        g.drawText (juce::String (countdown), juce::Rectangle<float> (r * 2.0f, r * 2.0f).withCentre (c), juce::Justification::centred);
+        return;
+    }
+
+    // Centre marker: soft translucent white circle with a fine crosshair.
     const float rad = 20.0f;
     g.setColour (juce::Colours::white.withAlpha (0.16f));
     g.fillEllipse (c.x - rad, c.y - rad, rad * 2.0f, rad * 2.0f);
