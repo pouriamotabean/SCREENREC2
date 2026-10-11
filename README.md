@@ -44,6 +44,17 @@ Skinned UI (plate image in `Resources/`), resizable 480x320 .. 960x640, 3:2.
   (-36 dB = muted .. +12 dB, double-click = 0 dB, Shift = fine).
 - LED bar = master level.
 
+## Recording extras
+- PAUSE / RESUME: paused time is left out of the file; sync stays exact.
+- 3-2-1 countdown before every recording (in the plugin and in the frame,
+  never in the video). Pressing REC during the countdown cancels.
+- DUCK: in the video only, the music drops 8 dB while you speak.
+- CLICKS: an amber ripple marks every mouse click in the video.
+- Click the status bar to open the last saved file in Explorer.
+- Crash recovery: if Cubase crashes while recording, the next time the plugin
+  window opens it rebuilds the MP4 (`..._recovered.mp4`).
+- Smallest frame depends on quality (screen area enlarged at most 2.5x).
+
 ## Install
 Download the `ScreenRec-VST3` artifact from GitHub Actions, unzip, copy
 `ScreenRec.vst3` (the whole folder, it contains ffmpeg.exe) to
