@@ -4,8 +4,8 @@
 
 // The on-screen capture frame (16:9 YouTube or 9:16 Reels): outline with a
 // centre marker, a MOVE handle (top-left: drag, mouse wheel = zoom,
-// double-click = default size) and a ZOOM handle (top-right: drag to resize
-// around the centre). Everything here is
+// double-click = default size), a ZOOM handle (top-right: drag to resize
+// around the centre) and a CLOSE button (bottom-right: hides the frame). Everything here is
 // visible on the monitor but excluded from the recording, and the frame itself
 // lets clicks through to Cubase.
 class FrameOverlay : private juce::Timer
@@ -25,7 +25,7 @@ private:
 
     struct Handle : juce::Component
     {
-        enum class Kind { move, zoom };
+        enum class Kind { move, zoom, close };
         Handle (FrameOverlay& o, Kind k) : owner (o), kind (k) {}
 
         void paint (juce::Graphics&) override;
@@ -61,6 +61,7 @@ private:
     FrameWindow frame;
     Handle moveHandle { *this, Handle::Kind::move };
     Handle zoomHandle { *this, Handle::Kind::zoom };
+    Handle closeHandle { *this, Handle::Kind::close };
 
     bool editorOpen = false;
     bool shown = false;

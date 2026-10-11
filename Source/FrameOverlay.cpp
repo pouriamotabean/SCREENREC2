@@ -15,7 +15,7 @@ FrameOverlay::FrameOverlay (Recorder& r) : recorder (r)
     frame.setInterceptsMouseClicks (false, false);
     frame.setAlwaysOnTop (true);
 
-    for (auto* h : { &moveHandle, &zoomHandle })
+    for (auto* h : { &moveHandle, &zoomHandle, &closeHandle })
     {
         h->setOpaque (false);
         h->setAlwaysOnTop (true);
@@ -26,6 +26,8 @@ FrameOverlay::FrameOverlay (Recorder& r) : recorder (r)
 
     moveHandle.setMouseCursor (juce::MouseCursor::DraggingHandCursor);
     zoomHandle.setMouseCursor (juce::MouseCursor::UpDownLeftRightResizeCursor);
+    closeHandle.setMouseCursor (juce::MouseCursor::PointingHandCursor);
+    closeHandle.setSize (handleSize - 6, handleSize - 6);
 
     startTimerHz (30);
 }
@@ -133,8 +135,10 @@ void FrameOverlay::show()
 
     moveHandle.addToDesktop (juce::ComponentPeer::windowIsTemporary);
     zoomHandle.addToDesktop (juce::ComponentPeer::windowIsTemporary);
+    closeHandle.addToDesktop (juce::ComponentPeer::windowIsTemporary);
     moveHandle.setVisible (true);
     zoomHandle.setVisible (true);
+    closeHandle.setVisible (true);
 
     excludedOk = true;
 
@@ -144,7 +148,7 @@ void FrameOverlay::show()
         excludedOk &= WinUtils::setExcludedFromCapture (peer->getNativeHandle(), true);
     }
 
-    for (auto* hd : { &moveHandle, &zoomHandle })
+    for (auto* hd : { &moveHandle, &zoomHandle, &closeHandle })
         if (auto* peer = hd->getPeer())
         {
             WinUtils::makeNoActivate (peer->getNativeHandle());
@@ -155,6 +159,7 @@ void FrameOverlay::show()
     layout();
     moveHandle.toFront (false);
     zoomHandle.toFront (false);
+    closeHandle.toFront (false);
 }
 
 void FrameOverlay::hide()
@@ -162,7 +167,8 @@ void FrameOverlay::hide()
     if (! shown)
         return;
 
-    for (juce::Component* c : { (juce::Component*) &moveHandle, (juce::Component*) &zoomHandle, (juce::Component*) &frame })
+    for (juce::Component* c : { (juce::Component*) &moveHandle, (juce::Component*) &zoomHandle,
+                                (juce::Component*) &closeHandle, (juce::Component*) &frame })
     {
         c->setVisible (false);
         if (c->isOnDesktop())
@@ -191,14 +197,20 @@ void FrameOverlay::layout()
     if (! area.contains (tr))
         tr = { r.getRight() - hs - gap, r.getY() + gap, hs, hs };
 
+    const int cs = closeHandle.getWidth();
+    juce::Rectangle<int> br (r.getRight() + gap, r.getBottom() - cs, cs, cs);
+    if (! area.contains (br))
+        br = { r.getRight() - cs - gap, r.getBottom() - cs - gap, cs, cs };
+
     moveHandle.setBounds (tl);
     zoomHandle.setBounds (tr);
+    closeHandle.setBounds (br);
 }
 
 void FrameOverlay::timerCallback()
 {
     const bool syncTestRunning = recorder.isSyncTest() && recorder.isBusy();
-    const bool want = ! syncTestRunning && (editorOpen || recorder.isBusy());
+    const bool want = recorder.isFrameVisible() && ! syncTestRunning && (editorOpen || recorder.isBusy());
 
     if (want && ! shown)  show();
     if (! want && shown)  hide();
@@ -284,10 +296,16 @@ void FrameOverlay::Handle::paint (juce::Graphics& g)
         p.addArrow ({ c.x, c.y, c.x, c.y - s }, 1.6f, 5.0f, 4.0f);
         p.addArrow ({ c.x, c.y, c.x, c.y + s }, 1.6f, 5.0f, 4.0f);
     }
-    else
+    else if (kind == Kind::zoom)
     {
         p.addArrow ({ c.x - s * 0.1f, c.y + s * 0.1f, c.x + s, c.y - s }, 1.6f, 6.0f, 5.0f);
         p.addArrow ({ c.x + s * 0.1f, c.y - s * 0.1f, c.x - s, c.y + s }, 1.6f, 6.0f, 5.0f);
+    }
+    else
+    {
+        const float k = s * 0.8f;
+        p.addLineSegment ({ c.x - k, c.y - k, c.x + k, c.y + k }, 2.0f);
+        p.addLineSegment ({ c.x - k, c.y + k, c.x + k, c.y - k }, 2.0f);
     }
 
     g.setColour (amber.withAlpha (hover ? 1.0f : 0.85f));
@@ -296,6 +314,9 @@ void FrameOverlay::Handle::paint (juce::Graphics& g)
 
 void FrameOverlay::Handle::mouseDown (const juce::MouseEvent&)
 {
+    if (kind == Kind::close)
+        return;
+
     owner.getFrame (startCx, startCy, startH);
     if (startH <= 0.0)
         startH = 1.0;
@@ -303,6 +324,9 @@ void FrameOverlay::Handle::mouseDown (const juce::MouseEvent&)
 
 void FrameOverlay::Handle::mouseDrag (const juce::MouseEvent& e)
 {
+    if (kind == Kind::close)
+        return;
+
     const auto a = owner.screenArea().toDouble();
     const auto d = (e.getScreenPosition() - e.getMouseDownScreenPosition()).toDouble();
 
@@ -323,8 +347,15 @@ void FrameOverlay::Handle::mouseDrag (const juce::MouseEvent& e)
     owner.setFrame (startCx, startCy, newH / a.getHeight());
 }
 
-void FrameOverlay::Handle::mouseUp (const juce::MouseEvent&)
+void FrameOverlay::Handle::mouseUp (const juce::MouseEvent& e)
 {
+    if (kind == Kind::close)
+    {
+        if (getLocalBounds().contains (e.getPosition()))
+            owner.recorder.setFrameVisible (false);   // timer hides the frame
+        return;
+    }
+
     owner.recorder.saveSettings();
 }
 
@@ -338,6 +369,9 @@ void FrameOverlay::Handle::mouseDoubleClick (const juce::MouseEvent&)
 
 void FrameOverlay::Handle::mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails& w)
 {
+    if (kind == Kind::close)
+        return;
+
     double cx, cy, h;
     owner.getFrame (cx, cy, h);
     if (h <= 0.0)

@@ -173,7 +173,7 @@ bool ScreenCapture::start (const std::wstring& cmd, const std::wstring& logPath)
         return false;
 
     const size_t frameBytes = (size_t) outW * (size_t) outH * 4;
-    buffers.assign (8, std::vector<uint8_t> (frameBytes, 0));
+    buffers.assign (frameBytes > 16u * 1024 * 1024 ? 5 : 8, std::vector<uint8_t> (frameBytes, 0));   // 4K frames are ~33 MB
     freeBuffers.clear();
     for (int i = 0; i < (int) buffers.size(); ++i)
         freeBuffers.push_back (i);

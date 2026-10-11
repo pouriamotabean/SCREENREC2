@@ -29,12 +29,14 @@ public:
 
     //==== message thread =======================================================
     // probeRect: physical screen pixels of the sync-test flash panel (test only).
-    void start (bool syncTest, juce::Rectangle<int> probeRect = {});
+    void start (bool syncTest, juce::Rectangle<int> probeRect = {}, bool micTest = false);
     void stop();
     void warmUp();      // probe the GPU encoder in the background (call when the editor opens)
 
     State getState() const          { return state.load(); }
     bool isSyncTest() const         { return syncTestMode.load(); }
+    bool isMicTest() const          { return micTestMode.load(); }
+    double getMicOffsetMs() const   { return micOffsetMs.load(); }
     double getElapsedSeconds() const;
     juce::String getStatusText() const;
     juce::String getEncoderName() const;
@@ -59,8 +61,28 @@ public:
     void getFrame (Mode m, double& cx, double& cy, double& h) const;
     void saveSettings();
 
+    // Output quality: 0 = 480p, 1 = 720p, 2 = 1080p, 3 = 4K (YOUTUBE only).
+    int getQuality() const          { return quality.load(); }
+    void setQuality (int q);        // ignored while busy
+    int effectiveQuality (Mode m) const { return (m == Mode::reels && quality.load() > 2) ? 2 : quality.load(); }
+    static void outputSize (Mode m, int q, int& w, int& h);
+    static int bitrateKbps (int q);
+
+    // Show / hide the on-screen frame (it is never in the recording anyway).
+    bool isFrameVisible() const     { return frameVisible.load(); }
+    void setFrameVisible (bool v)   { frameVisible = v; saveSettings(); }
+
     // Side-chain mic meter (peak since last call) and whether a side-chain is connected.
     float takeMicLevel()            { return micLevel.exchange (0.0f); }
+    float takeMasterLevel()         { return masterLevel.exchange (0.0f); }
+
+    // Mic level in the video (knob). <= -36 dB means muted. Applied live.
+    float getMicGainDb() const      { return micGainDb.load(); }
+    void setMicGainDb (float db)    { micGainDb = juce::jlimit (-36.0f, 12.0f, db); }
+
+    // Plugin window width (persisted).
+    int getUiWidth() const          { return uiWidth.load(); }
+    void setUiWidth (int w)         { uiWidth = w; }
     bool isMicConnected() const     { return micConnected.load(); }
 
     bool isBusy() const
@@ -72,7 +94,11 @@ public:
 private:
     void timerCallback() override;
 
-    void runStart (bool syncTest, juce::Rectangle<int> probeRect);
+    void runStart (bool syncTest, juce::Rectangle<int> probeRect, bool micTest);
+    void runFinishMicTest();
+    double analyseMicTest (const juce::File& masterWav, const juce::File& micWav, int& pairsFound);
+    double testBeepTime (int k) const;
+    int testBeepCount() const;
     void runFinish();
     void drainLoop();
     void drainOnce();
@@ -82,7 +108,7 @@ private:
     void log (const juce::String& s);
 
     juce::File findFfmpeg() const;
-    juce::StringArray videoEncoderArgs (const juce::String& encoder) const;
+    juce::StringArray videoEncoderArgs (const juce::String& encoder, int kbps = 8000) const;
     std::wstring buildCommand (const juce::StringArray& args) const;
 
     bool renderAlignedAudio (const juce::File& rawWav, const juce::File& outWav,
@@ -98,11 +124,19 @@ private:
     //==== shared state =========================================================
     std::atomic<State> state { State::idle };
     std::atomic<bool> syncTestMode { false };
+    std::atomic<bool> micTestMode { false };
+    std::atomic<double> micOffsetMs { 0.0 };
+    std::atomic<int> quality { 2 };          // 0 = 480, 1 = 720, 2 = 1080, 3 = 4K
+    std::atomic<bool> frameVisible { true };
     std::atomic<bool> audioActive { false };       // audio thread pushes while true
     std::atomic<double> syncOffsetMs { 0.0 };
     std::atomic<int> mode { 0 };
     std::atomic<double> frames[2][3] { { { 0.5 }, { 0.5 }, { -1.0 } }, { { 0.5 }, { 0.5 }, { -1.0 } } };
     std::atomic<float> micLevel { 0.0f };
+    std::atomic<float> masterLevel { 0.0f };
+    std::atomic<float> micGainDb { 0.0f };
+    std::atomic<int> uiWidth { 600 };
+    float currentMicGain = 1.0f;   // audio thread
     std::atomic<bool> micConnected { false };
     float sessionMicPeak = 0.0f;
     std::atomic<double> currentSampleRate { 48000.0 };

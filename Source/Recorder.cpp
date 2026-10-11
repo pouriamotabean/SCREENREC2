@@ -38,6 +38,11 @@ Recorder::Recorder()
 {
     loadSyncOffset();
     loadSettings();
+    {
+        const auto f = getOutputFolder().getChildFile ("mic_offset_ms.txt");
+        if (f.existsAsFile())
+            micOffsetMs = f.loadFileAsString().trim().getDoubleValue();
+    }
     startTimerHz (20);
 }
 
@@ -87,12 +92,27 @@ void Recorder::prepare (double sampleRate, int maxBlockSize)
 
 void Recorder::processAudio (juce::AudioBuffer<float>& buffer, const juce::AudioBuffer<float>* sidechain)
 {
-    // Mic level meter works even when not recording.
+    // Mic gain (knob), ramped per block.
+    const float gDb = micGainDb.load (std::memory_order_relaxed);
+    const float targetMicGain = gDb <= -35.9f ? 0.0f : juce::Decibels::decibelsToGain (gDb);
+    const float startMicGain = currentMicGain;
+    currentMicGain = targetMicGain;
+
+    // Meters work even when not recording.
+    {
+        float pk = 0.0f;
+        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+            pk = juce::jmax (pk, buffer.getMagnitude (ch, 0, buffer.getNumSamples()));
+        if (pk > masterLevel.load (std::memory_order_relaxed))
+            masterLevel.store (pk, std::memory_order_relaxed);
+    }
+
     if (sidechain != nullptr && sidechain->getNumChannels() > 0 && sidechain->getNumSamples() > 0)
     {
         float pk = 0.0f;
         for (int ch = 0; ch < sidechain->getNumChannels(); ++ch)
             pk = juce::jmax (pk, sidechain->getMagnitude (ch, 0, sidechain->getNumSamples()));
+        pk *= targetMicGain;
         if (pk > micLevel.load (std::memory_order_relaxed))
             micLevel.store (pk, std::memory_order_relaxed);
         micConnected.store (true, std::memory_order_relaxed);
@@ -126,7 +146,7 @@ void Recorder::processAudio (juce::AudioBuffer<float>& buffer, const juce::Audio
     const double sr = sessionSampleRate;
 
     // ---- sync test: put a short beep into the output at the scheduled times
-    if (syncTestMode.load())
+    if (syncTestMode.load() || micTestMode.load())
     {
         const int64_t freq = Timing::frequency();
         const int64_t blockEnd = now + (int64_t) ((double) numSamples / sr * (double) freq);
@@ -136,11 +156,11 @@ void Recorder::processAudio (juce::AudioBuffer<float>& buffer, const juce::Audio
         {
             if (clickSamplesLeft <= 0)
             {
-                if (nextClickIndex >= testFlashCount)
+                if (nextClickIndex >= testBeepCount())
                     break;
 
                 const int64_t tk = testFirstFlash.load()
-                                 + Timing::fromSeconds (nextClickIndex * testFlashInterval);
+                                 + Timing::fromSeconds (testBeepTime (nextClickIndex));
                 if (tk >= blockEnd)
                     break;
 
@@ -157,7 +177,7 @@ void Recorder::processAudio (juce::AudioBuffer<float>& buffer, const juce::Audio
 
             for (int i = 0; i < n; ++i)
             {
-                const float v = (float) (clickLevel * std::sin (clickPhase));
+                const float v = (float) ((micTestMode.load() ? 0.3 : clickLevel) * std::sin (clickPhase));
                 clickPhase += inc;
                 for (int ch = 0; ch < numChannels; ++ch)
                     buffer.addSample (ch, pos + i, v);
@@ -194,12 +214,15 @@ void Recorder::processAudio (juce::AudioBuffer<float>& buffer, const juce::Audio
         auto copy = [&] (int dst, int count, int srcOffset)
         {
             float* d = audioFifoData.data() + (size_t) dst * 4;
+            const float gStep = (targetMicGain - startMicGain) / (float) juce::jmax (1, numSamples);
             for (int i = 0; i < count; ++i)
             {
+                const float g = micTestMode.load (std::memory_order_relaxed) ? 1.0f
+                              : startMicGain + gStep * (float) (srcOffset + i);
                 d[i * 4]     = left[srcOffset + i];
                 d[i * 4 + 1] = right[srcOffset + i];
-                d[i * 4 + 2] = hasMic ? micL[srcOffset + i] : 0.0f;
-                d[i * 4 + 3] = hasMic ? micR[srcOffset + i] : 0.0f;
+                d[i * 4 + 2] = hasMic ? micL[srcOffset + i] * g : 0.0f;
+                d[i * 4 + 3] = hasMic ? micR[srcOffset + i] * g : 0.0f;
             }
         };
 
@@ -221,7 +244,7 @@ void Recorder::warmUp()
     probeThread = std::thread ([this] { probeEncoder(); });
 }
 
-void Recorder::start (bool syncTest, juce::Rectangle<int> probeRect)
+void Recorder::start (bool syncTest, juce::Rectangle<int> probeRect, bool micTest)
 {
     const auto s = state.load();
     if (s == State::starting || s == State::recording || s == State::saving)
@@ -236,14 +259,15 @@ void Recorder::start (bool syncTest, juce::Rectangle<int> probeRect)
 
     joinWorker();
     state = State::starting;
-    syncTestMode = syncTest;
+    syncTestMode = syncTest && ! micTest;
+    micTestMode = micTest;
     stopRequested = false;
-    setStatus (syncTest ? "Sync test: starting..." : "Starting...");
+    setStatus (micTest ? "Mic test: starting..." : (syncTest ? "Sync test: starting..." : "Starting..."));
 
     workerBusy = true;
-    worker = std::thread ([this, syncTest, probeRect]
+    worker = std::thread ([this, syncTest, probeRect, micTest]
     {
-        runStart (syncTest, probeRect);
+        runStart (syncTest && ! micTest, probeRect, micTest);
         workerBusy = false;
     });
 }
@@ -340,10 +364,10 @@ void Recorder::timerCallback()
             setStatus ("Video encoder stopped - saving what was recorded");
             stop();
         }
-        else if (syncTestMode.load())
+        else if (syncTestMode.load() || micTestMode.load())
         {
             const int64_t end = testFirstFlash.load()
-                              + Timing::fromSeconds (testFlashCount * testFlashInterval + 1.0);
+                              + Timing::fromSeconds (testBeepTime (testBeepCount() - 1) + (micTestMode.load() ? 2.5 : 1.0));
             if (Timing::now() > end)
                 stop();
         }
@@ -353,7 +377,7 @@ void Recorder::timerCallback()
 //==============================================================================
 // Encoder selection
 
-juce::StringArray Recorder::videoEncoderArgs (const juce::String& enc) const
+juce::StringArray Recorder::videoEncoderArgs (const juce::String& enc, int kbps) const
 {
     juce::StringArray a;
     const bool software = (enc == "libx264");
@@ -370,7 +394,8 @@ juce::StringArray Recorder::videoEncoderArgs (const juce::String& enc) const
     else
         a.addArray ({ "-c:v", "libx264", "-preset", "veryfast" });
 
-    a.addArray ({ "-b:v", "8M", "-maxrate", "12M", "-bufsize", "16M", "-g", "60",
+    a.addArray ({ "-b:v", juce::String (kbps) + "k", "-maxrate", juce::String (kbps * 3 / 2) + "k",
+                  "-bufsize", juce::String (kbps * 2) + "k", "-g", "60",
                   "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv" });
     return a;
 }
@@ -435,8 +460,14 @@ juce::File Recorder::findFfmpeg() const
 //==============================================================================
 // Start
 
-void Recorder::runStart (bool syncTest, juce::Rectangle<int> probeRect)
+void Recorder::runStart (bool syncTest, juce::Rectangle<int> probeRect, bool micTest)
 {
+    if (micTest && ! isMicConnected())
+    {
+        fail ("Mic test: side-chain is off. Activate ScreenRec side-chain and send the mic to it.");
+        return;
+    }
+
     const auto ff = findFfmpeg();
     if (! ff.existsAsFile())
     {
@@ -445,7 +476,7 @@ void Recorder::runStart (bool syncTest, juce::Rectangle<int> probeRect)
     }
 
     const auto outDir = getOutputFolder();
-    sessionName = juce::String (syncTest ? "SyncTest_" : (getMode() == Mode::reels ? "Reels_" : "YouTube_"))
+    sessionName = juce::String (micTest ? "MicTest_" : syncTest ? "SyncTest_" : (getMode() == Mode::reels ? "Reels_" : "YouTube_"))
                 + juce::Time::getCurrentTime().formatted ("%Y-%m-%d_%H-%M-%S");
     sessionTempDir = outDir.getChildFile (".temp").getChildFile (sessionName);
     sessionOutput = outDir.getChildFile (sessionName + ".mp4");
@@ -473,10 +504,14 @@ void Recorder::runStart (bool syncTest, juce::Rectangle<int> probeRect)
     log ("video encoder: " + enc);
 
     const Mode m = getMode();
+    const int q = effectiveQuality (m);
+    int outW = 1920, outH = 1080;
+    outputSize (m, q, outW, outH);
+
     capture = std::make_unique<ScreenCapture>();
     capture->setRegionSource (frames[(int) m]);
     if (! (syncTest ? capture->openFullScreen()
-                    : capture->open (aspectOf (m), m == Mode::reels ? 1080 : 1920, m == Mode::reels ? 1920 : 1080)))
+                    : capture->open (aspectOf (m), outW, outH)))
     {
         fail ("Cannot read screen size");
         return;
@@ -526,12 +561,24 @@ void Recorder::runStart (bool syncTest, juce::Rectangle<int> probeRect)
     drainRunning = true;
     drainThread = std::thread ([this] { drainLoop(); });
 
+    if (micTest)
+    {
+        // Audio only: beeps go to the headphones, the mic hears them, we measure the gap.
+        capture.reset();
+        captureStartTicks = Timing::now() + Timing::frequency() / 10;
+        testFirstFlash = captureStartTicks.load() + Timing::fromSeconds (1.0);
+        audioActive.store (true, std::memory_order_release);
+        state = State::recording;
+        setStatus ("Mic test: hold your headphones against the mic, stay quiet");
+        return;
+    }
+
     // ---- video side
     juce::StringArray args { "-hide_banner", "-loglevel", "warning", "-y",
                              "-f", "rawvideo", "-pix_fmt", "bgra",
                              "-video_size", juce::String (capture->getOutputWidth()) + "x" + juce::String (capture->getOutputHeight()),
                              "-framerate", juce::String (ScreenCapture::fps), "-i", "-" };
-    args.addArray (videoEncoderArgs (enc));
+    args.addArray (videoEncoderArgs (enc, syncTest ? 8000 : bitrateKbps (q)));
     args.add (sessionTempDir.getChildFile ("video.mkv").getFullPathName());
 
     audioActive.store (true, std::memory_order_release);
@@ -615,6 +662,12 @@ void Recorder::drainOnce()
 
 void Recorder::runFinish()
 {
+    if (micTestMode.load())
+    {
+        runFinishMicTest();
+        return;
+    }
+
     const bool videoOk = capture != nullptr && capture->stop();
     const int64_t frames = capture != nullptr ? capture->getFrameCount() : 0;
     const int64_t t0 = captureStartTicks.load();
@@ -668,7 +721,7 @@ void Recorder::runFinish()
         const auto alignedMic = sessionTempDir.getChildFile ("audio_mic.wav");
         aligned = sessionTempDir.getChildFile ("audio_aligned.wav");
 
-        if (! renderAlignedAudio (rawAudio, alignedMic, t0, frames, 2, -blockTime)
+        if (! renderAlignedAudio (rawAudio, alignedMic, t0, frames, 2, -blockTime + micOffsetMs.load() / 1000.0)
             || ! mixWavFiles (alignedMaster, alignedMic, aligned))
         {
             fail ("Mic alignment failed - see log");
@@ -1039,6 +1092,10 @@ void Recorder::loadSettings()
         const auto val = l.fromFirstOccurrenceOf ("=", false, false).trim();
 
         if (key == "mode") mode = (val == "reels") ? 1 : 0;
+        if (key == "quality") quality = juce::jlimit (0, 3, val.getIntValue());
+        if (key == "show_frame") frameVisible = val.getIntValue() != 0;
+        if (key == "mic_gain_db") setMicGainDb ((float) val.getDoubleValue());
+        if (key == "ui_width") uiWidth = juce::jlimit (480, 960, val.getIntValue());
 
         for (int m = 0; m < 2; ++m)
         {
@@ -1058,7 +1115,11 @@ void Recorder::saveSettings()
     getOutputFolder().createDirectory();
 
     juce::String t;
-    t << "mode=" << (getMode() == Mode::reels ? "reels" : "youtube") << "\r\n";
+    t << "mode=" << (getMode() == Mode::reels ? "reels" : "youtube") << "\r\n"
+      << "quality=" << quality.load() << "\r\n"
+      << "show_frame=" << (frameVisible.load() ? 1 : 0) << "\r\n"
+      << "mic_gain_db=" << juce::String (micGainDb.load(), 1) << "\r\n"
+      << "ui_width=" << uiWidth.load() << "\r\n";
 
     for (int m = 0; m < 2; ++m)
     {
@@ -1107,4 +1168,201 @@ bool Recorder::mixWavFiles (const juce::File& a, const juce::File& b, const juce
     }
 
     return true;
+}
+
+//==============================================================================
+// Quality
+
+void Recorder::setQuality (int q)
+{
+    if (isBusy())
+        return;
+
+    quality = juce::jlimit (0, 3, q);
+    saveSettings();
+}
+
+void Recorder::outputSize (Mode m, int q, int& w, int& h)
+{
+    static const int heights[] = { 480, 720, 1080, 2160 };
+    static const int widths[]  = { 854, 1280, 1920, 3840 };
+    q = juce::jlimit (0, 3, q);
+    if (m == Mode::reels && q > 2)
+        q = 2;
+
+    if (m == Mode::reels) { w = heights[q]; h = widths[q]; }
+    else                  { w = widths[q];  h = heights[q]; }
+}
+
+int Recorder::bitrateKbps (int q)
+{
+    static const int kbps[] = { 2500, 5000, 8000, 30000 };
+    return kbps[juce::jlimit (0, 3, q)];
+}
+
+//==============================================================================
+// Test beeps. Sync test: steady. Mic test: irregular, so the measured gap can
+// never be confused with a whole beep interval.
+
+double Recorder::testBeepTime (int k) const
+{
+    static const double micTimes[] = { 0.0, 0.7, 1.8, 2.7, 4.0, 4.8, 6.0, 7.0, 8.4 };
+
+    if (micTestMode.load())
+        return micTimes[juce::jlimit (0, 8, k)];
+
+    return k * testFlashInterval;
+}
+
+int Recorder::testBeepCount() const
+{
+    return micTestMode.load() ? 9 : testFlashCount;
+}
+
+//==============================================================================
+// Mic test
+
+void Recorder::runFinishMicTest()
+{
+    const int64_t t0 = captureStartTicks.load();
+    const int64_t frames = juce::jmax<int64_t> (1, (int64_t) (Timing::toSeconds (Timing::now() - t0) * ScreenCapture::fps));
+
+    audioActive.store (false, std::memory_order_release);
+    std::this_thread::sleep_for (std::chrono::milliseconds (150));
+
+    drainRunning = false;
+    if (drainThread.joinable())
+        drainThread.join();
+    drainOnce();
+    rawWriter.reset();
+
+    setStatus ("Mic test: measuring...");
+
+    const double blockTime = (double) sessionBlockSize / sessionSampleRate;
+    const double offset = syncOffsetMs.load() / 1000.0;
+    const double oldMic = micOffsetMs.load() / 1000.0;
+
+    const auto raw = sessionTempDir.getChildFile ("audio_raw.wav");
+    const auto master = sessionTempDir.getChildFile ("audio_master.wav");
+    const auto mic = sessionTempDir.getChildFile ("audio_mic.wav");
+
+    juce::String result;
+
+    if (sessionMicPeak < 0.003f)
+    {
+        result = "Mic test failed: the mic heard nothing. Hold the headphones right on the mic and turn them up.";
+    }
+    else if (! renderAlignedAudio (raw, master, t0, frames, 0, blockTime + offset)
+             || ! renderAlignedAudio (raw, mic, t0, frames, 2, -blockTime + oldMic))
+    {
+        result = "Mic test failed - see log";
+    }
+    else
+    {
+        int pairs = 0;
+        const double gap = analyseMicTest (master, mic, pairs);
+
+        if (pairs >= 5)
+        {
+            const double newMs = juce::jlimit (-3000.0, 3000.0, (oldMic + gap) * 1000.0);
+            micOffsetMs = newMs;
+            getOutputFolder().getChildFile ("mic_offset_ms.txt").replaceWithText (juce::String (newMs, 1));
+            log ("mic test: gap " + juce::String (gap * 1000.0, 1) + " ms from " + juce::String (pairs)
+                 + " beeps -> mic offset " + juce::String (newMs, 1) + " ms");
+            result = "Mic fixed: was off by " + juce::String (gap * 1000.0, 0) + " ms, mic offset now "
+                   + juce::String (newMs, 0) + " ms";
+        }
+        else
+        {
+            result = "Mic test failed (" + juce::String (pairs) + "/9 beeps heard). Hold the headphones on the mic, stay quiet, try again.";
+        }
+    }
+
+    sessionTempDir.deleteRecursively();
+    audioFifo.reset();
+    stampFifo.reset();
+
+    setStatus (result);
+    state = State::idle;
+    anyInstanceBusy = false;
+}
+
+double Recorder::analyseMicTest (const juce::File& masterWav, const juce::File& micWav, int& pairsFound)
+{
+    pairsFound = 0;
+
+    juce::AudioFormatManager fm;
+    fm.registerBasicFormats();
+
+    auto findOnsets = [&] (const juce::File& f, bool relative) -> std::vector<double>
+    {
+        std::vector<double> onsets;
+        std::unique_ptr<juce::AudioFormatReader> r (fm.createReaderFor (f));
+        if (r == nullptr)
+            return onsets;
+
+        const double sr = r->sampleRate;
+        float threshold = 0.2f;
+
+        if (relative)
+        {
+            float peak = 0.0f;
+            juce::AudioBuffer<float> b (2, 16384);
+            for (int64_t pos = 0; pos < r->lengthInSamples; pos += 16384)
+            {
+                const int n = (int) juce::jmin<int64_t> (16384, r->lengthInSamples - pos);
+                r->read (&b, 0, n, pos, true, true);
+                peak = juce::jmax (peak, b.getMagnitude (0, n));
+            }
+            threshold = peak * 0.3f;
+        }
+
+        juce::AudioBuffer<float> b (2, 16384);
+        int64_t last = -(int64_t) sr;
+        for (int64_t pos = 0; pos < r->lengthInSamples; pos += 16384)
+        {
+            const int n = (int) juce::jmin<int64_t> (16384, r->lengthInSamples - pos);
+            r->read (&b, 0, n, pos, true, true);
+            for (int i = 0; i < n; ++i)
+            {
+                const float v = juce::jmax (std::abs (b.getSample (0, i)), std::abs (b.getSample (1, i)));
+                if (v > threshold && pos + i - last > (int64_t) (0.35 * sr))
+                {
+                    onsets.push_back ((double) (pos + i) / sr);
+                    last = pos + i;
+                }
+            }
+        }
+        return onsets;
+    };
+
+    const auto beeps = findOnsets (masterWav, false);
+    const auto heard = findOnsets (micWav, true);
+    log ("mic test: beeps " + juce::String ((int) beeps.size()) + ", mic onsets " + juce::String ((int) heard.size()));
+
+    // Find the one delay that lines up the most beeps with mic onsets.
+    std::vector<double> diffs;
+    for (double b : beeps)
+        for (double h : heard)
+            if (h - b > -0.5 && h - b < 2.5)
+                diffs.push_back (h - b);
+
+    double bestLag = 0.0;
+    int bestCount = 0;
+    for (double d : diffs)
+    {
+        int c = 0;
+        for (double e : diffs)
+            if (std::abs (e - d) < 0.03)
+                ++c;
+        if (c > bestCount) { bestCount = c; bestLag = d; }
+    }
+
+    std::vector<double> matched;
+    for (double d : diffs)
+        if (std::abs (d - bestLag) < 0.03)
+            matched.push_back (d);
+
+    pairsFound = (int) matched.size();
+    return -median (matched);   // mic is late by median -> move it earlier
 }
