@@ -25,6 +25,25 @@ send to "ScreenRec - Side-Chain" and set the mic track output to "No Bus". The
 mic is recorded into the video (placed at the moment you spoke) but never sent
 to the output. The MIC meter in the plugin shows that it arrives.
 
+## MIC TEST (one time, after changing the master chain or buffer)
+Plugins on Stereo Out before ScreenRec make Cubase delay the side-chain. MIC
+TEST measures it: stop playback, hold the headphones against the mic and press
+MIC TEST. Nine beeps are played; the plugin measures when the mic hears them and
+stores the mic offset (`Documents\ScreenRec\mic_offset_ms.txt`).
+
+## Quality
+480 / 720 / 1080 / 4K (4K for YOUTUBE only). Bitrates 2.5 / 5 / 8 / 30 Mbit/s.
+
+## Frame
+SHOW FRAME toggles the on-screen frame; the small X at its bottom-right corner
+hides it too. Hidden or not, the frame area is what gets recorded.
+
+## Interface
+Skinned UI (plate image in `Resources/`), resizable 480x320 .. 960x640, 3:2.
+- VU meter = mic as it goes into the video; knob = mic level in the video
+  (-36 dB = muted .. +12 dB, double-click = 0 dB, Shift = fine).
+- LED bar = master level.
+
 ## Install
 Download the `ScreenRec-VST3` artifact from GitHub Actions, unzip, copy
 `ScreenRec.vst3` (the whole folder, it contains ffmpeg.exe) to
