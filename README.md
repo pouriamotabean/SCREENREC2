@@ -51,6 +51,7 @@ Skinned UI (plate image in `Resources/`), resizable 480x320 .. 960x640, 3:2.
 - DUCK: in the video only, the music drops 10 dB while you speak.
 - CLICKS: an amber ripple marks every mouse click in the video.
 - Click the status bar to open the last saved file in Explorer.
+- The "?" on the header opens a short quick guide.
 - Crash recovery: if Cubase crashes while recording, the next time the plugin
   window opens it rebuilds the MP4 (`..._recovered.mp4`).
 - Smallest frame depends on quality (screen area enlarged at most 2.5x).
