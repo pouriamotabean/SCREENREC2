@@ -84,6 +84,7 @@ ScreenRecEditor::ScreenRecEditor (ScreenRecProcessor& p)
     areas[aDuck]     = { 50, 689, 170, 44 };
     areas[aClicks]   = { 256, 689, 170, 44 };
     areas[aStatus]   = { 66, 830, 1012, 82 };
+    areas[aHelp]     = { 1418, 64, 44, 44 };
 
     addChildComponent (flash);
     flash.setInterceptsMouseClicks (false, false);
@@ -507,6 +508,101 @@ void ScreenRecEditor::paint (juce::Graphics& g)
     // ---- tests
     drawMetalButton (g, areas[aMicTest], "MIC TEST", recorder.isMicTest() && recording, idle, hover == aMicTest);
     drawMetalButton (g, areas[aSyncTest], "SYNC TEST", recorder.isSyncTest() && recording, idle, hover == aSyncTest);
+
+    // ---- help button: engraved "?" on the steel header
+    {
+        const auto r = areas[aHelp];
+        g.setColour (juce::Colours::black.withAlpha (0.35f));
+        g.fillEllipse (r.translated (0, 1.5f));
+        juce::ColourGradient grad (juce::Colour (0xff3a3936), r.getX(), r.getY(), juce::Colour (0xff161616), r.getX(), r.getBottom(), false);
+        g.setGradientFill (grad);
+        g.fillEllipse (r.reduced (1.0f));
+        g.setColour ((hover == aHelp || helpOpen) ? amber : juce::Colour (0xffcfc6b8).withAlpha (0.85f));
+        g.drawEllipse (r.reduced (1.5f), 1.5f);
+        g.setFont (sans (26.0f, true, 0.0f));
+        g.drawText ("?", r.translated (0, -1.0f), juce::Justification::centred);
+    }
+
+    if (helpOpen)
+        drawHelp (g);
+}
+
+void ScreenRecEditor::drawHelp (juce::Graphics& g) const
+{
+    struct Line { const char* text; int kind; };   // 0 = title, 1 = heading, 2 = body, 3 = gap
+    static const Line lines[] = {
+        { "SCREENREC  -  QUICK GUIDE", 0 }, { "", 3 },
+        { "RECORD", 1 },
+        { "Put ScreenRec last on Stereo Out. REC starts after 3-2-1, REC again stops.", 2 },
+        { "Files go to Documents\\ScreenRec. Click the status bar to open the last one.", 2 },
+        { "FRAME", 1 },
+        { "YOUTUBE 16:9 / REELS 9:16. Top-left handle: move (wheel = zoom,", 2 },
+        { "double-click = default). Top-right handle: zoom. Works while recording.", 2 },
+        { "The frame and this window never appear in the video.", 2 },
+        { "MIC  (no headphone delay)", 1 },
+        { "Turn on ScreenRec's side-chain. On the mic track: Send -> ScreenRec", 2 },
+        { "Side-Chain, output -> No Bus. Knob = mic level in the video.", 2 },
+        { "VU = mic, LEDs = master.", 2 },
+        { "SYNC  (once, transport stopped)", 1 },
+        { "SYNC TEST: keep this window visible, wait ~15 s.", 2 },
+        { "MIC TEST: hold headphones against the mic, stay quiet ~12 s.", 2 },
+        { "Repeat after changing master plugins or the ASIO buffer.", 2 },
+        { "EXTRAS", 1 },
+        { "PAUSE: left out of the file.   DUCK: music -10 dB under your voice.", 2 },
+        { "CLICKS: ripples on clicks.   Crashed recordings are recovered on reopen.", 2 },
+    };
+
+    // dim everything, then a dark glass card
+    g.setColour (juce::Colours::black.withAlpha (0.55f));
+    g.fillRect (juce::Rectangle<float> (0, 0, skinW, skinH));
+
+    const juce::Rectangle<float> card (150, 120, 1236, 800);
+    g.setColour (juce::Colour (0xf20d0d0d));
+    g.fillRoundedRectangle (card, 14.0f);
+    g.setColour (amber.withAlpha (0.7f));
+    g.drawRoundedRectangle (card.reduced (1.0f), 14.0f, 2.0f);
+
+    // close mark
+    g.setColour (labelText.withAlpha (0.7f));
+    const auto x = juce::Rectangle<float> (card.getRight() - 58, card.getY() + 22, 30, 30);
+    g.drawLine (x.getX(), x.getY(), x.getRight(), x.getBottom(), 2.5f);
+    g.drawLine (x.getX(), x.getBottom(), x.getRight(), x.getY(), 2.5f);
+
+    float y = card.getY() + 34.0f;
+    const float left = card.getX() + 56.0f, width = card.getWidth() - 112.0f;
+
+    for (const auto& l : lines)
+    {
+        switch (l.kind)
+        {
+            case 0:
+                g.setColour (amber);
+                g.setFont (sans (30.0f, true, 0.2f));
+                g.drawText (l.text, juce::Rectangle<float> (left, y, width, 38), juce::Justification::centredLeft);
+                y += 38.0f;
+                break;
+            case 1:
+                y += 10.0f;
+                g.setColour (amber.withAlpha (0.95f));
+                g.setFont (sans (21.0f, true, 0.22f));
+                g.drawText (l.text, juce::Rectangle<float> (left, y, width, 30), juce::Justification::centredLeft);
+                y += 32.0f;
+                break;
+            case 2:
+                g.setColour (labelText.withAlpha (0.92f));
+                g.setFont (sans (22.0f, false, 0.02f));
+                g.drawText (l.text, juce::Rectangle<float> (left + 18.0f, y, width - 18.0f, 30), juce::Justification::centredLeft);
+                y += 30.0f;
+                break;
+            default:
+                y += 4.0f;
+                break;
+        }
+    }
+
+    g.setColour (dimText);
+    g.setFont (sans (15.0f, false, 0.2f));
+    g.drawText ("CLICK ANYWHERE TO CLOSE", juce::Rectangle<float> (card.getX(), card.getBottom() - 44, card.getWidth(), 30), juce::Justification::centred);
 }
 
 //==============================================================================
@@ -514,7 +610,7 @@ void ScreenRecEditor::paint (juce::Graphics& g)
 
 void ScreenRecEditor::mouseMove (const juce::MouseEvent& e)
 {
-    const int h = areaAt (toSkin (e.position));
+    const int h = helpOpen ? -1 : areaAt (toSkin (e.position));
     if (h != hover)
     {
         hover = h;
@@ -537,7 +633,7 @@ void ScreenRecEditor::mouseExit (const juce::MouseEvent&)
 
 void ScreenRecEditor::mouseDown (const juce::MouseEvent& e)
 {
-    draggingKnob = areaAt (toSkin (e.position)) == aKnob;
+    draggingKnob = ! helpOpen && areaAt (toSkin (e.position)) == aKnob;
     dragStartDb = recorder.getMicGainDb();
 }
 
@@ -553,13 +649,13 @@ void ScreenRecEditor::mouseDrag (const juce::MouseEvent& e)
 
 void ScreenRecEditor::mouseDoubleClick (const juce::MouseEvent& e)
 {
-    if (areaAt (toSkin (e.position)) == aKnob)
+    if (! helpOpen && areaAt (toSkin (e.position)) == aKnob)
         setKnobFromDb (0.0f);
 }
 
 void ScreenRecEditor::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w)
 {
-    if (areaAt (toSkin (e.position)) == aKnob)
+    if (! helpOpen && areaAt (toSkin (e.position)) == aKnob)
     {
         const float v = knobValueFromDb (recorder.getMicGainDb()) + w.deltaY * 0.2f;
         setKnobFromDb (knobDbFromValue (juce::jlimit (-1.0f, 1.0f, v)));
@@ -575,12 +671,20 @@ void ScreenRecEditor::mouseUp (const juce::MouseEvent& e)
         return;
     }
 
+    if (helpOpen)   // any click closes the guide
+    {
+        helpOpen = false;
+        repaint();
+        return;
+    }
+
     const auto state = recorder.getState();
     const bool idle = state == Recorder::State::idle || state == Recorder::State::error;
     const bool reels = recorder.getMode() == Recorder::Mode::reels;
 
     switch (areaAt (toSkin (e.position)))
     {
+        case aHelp:    helpOpen = true; break;
         case aRec:
             if (state == Recorder::State::recording)       recorder.stop();
             else if (state == Recorder::State::starting)   recorder.stop();   // cancels the countdown
