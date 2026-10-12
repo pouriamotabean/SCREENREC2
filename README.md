@@ -48,7 +48,7 @@ Skinned UI (plate image in `Resources/`), resizable 480x320 .. 960x640, 3:2.
 - PAUSE / RESUME: paused time is left out of the file; sync stays exact.
 - 3-2-1 countdown before every recording (in the plugin and in the frame,
   never in the video). Pressing REC during the countdown cancels.
-- DUCK: in the video only, the music drops 8 dB while you speak.
+- DUCK: in the video only, the music drops 10 dB while you speak.
 - CLICKS: an amber ripple marks every mouse click in the video.
 - Click the status bar to open the last saved file in Explorer.
 - Crash recovery: if Cubase crashes while recording, the next time the plugin
