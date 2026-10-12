@@ -1293,16 +1293,17 @@ bool Recorder::mixWavFiles (const juce::File& a, const juce::File& b, const juce
     const int64_t len = juce::jmax (ra->lengthInSamples, rb->lengthInSamples);
     juce::AudioBuffer<float> ba (2, 16384), bb (2, 16384);
 
-    // Ducking: while the voice is present the music drops by 8 dB
-    // (fast down, holds 250 ms, comes back over ~0.5 s). Video only.
+    // Ducking: while the voice is present the music drops by 10 dB
+    // (fast down, holds 400 ms between words, comes back over ~0.8 s). Video only.
     const double sr = ra->sampleRate > 0 ? ra->sampleRate : 48000.0;
-    const float duckGain = juce::Decibels::decibelsToGain (-8.0f);
+    const float duckGain = juce::Decibels::decibelsToGain (-10.0f);
     const float threshold = juce::Decibels::decibelsToGain (-40.0f);
     const float envAttack  = (float) (1.0 - std::exp (-1.0 / (0.005 * sr)));
     const float envRelease = (float) (1.0 - std::exp (-1.0 / (0.150 * sr)));
     const float gDown = (float) (1.0 - std::exp (-1.0 / (0.060 * sr)));
-    const float gUp   = (float) (1.0 - std::exp (-1.0 / (0.500 * sr)));
-    const int holdSamples = (int) (0.25 * sr);
+    const float gUp   = (float) (1.0 - std::exp (-1.0 / (0.800 * sr)));
+    const int holdSamples = (int) (0.40 * sr);
+    int64_t duckedSamples = 0;
     float env = 0.0f, gain = 1.0f;
     int hold = 0;
 
@@ -1333,6 +1334,8 @@ bool Recorder::mixWavFiles (const juce::File& a, const juce::File& b, const juce
 
                 l[i] *= gain;
                 r[i] *= gain;
+                if (gain < 0.9f)
+                    ++duckedSamples;
             }
         }
 
@@ -1340,6 +1343,12 @@ bool Recorder::mixWavFiles (const juce::File& a, const juce::File& b, const juce
             ba.addFrom (ch, 0, bb, ch, 0, n);
         w->writeFromAudioSampleBuffer (ba, 0, n);
     }
+
+    if (duck)
+        log ("duck: on (-10 dB), music lowered during " + juce::String (len > 0 ? 100.0 * (double) duckedSamples / (double) len : 0.0, 1)
+             + "% of the video");
+    else
+        log ("duck: off");
 
     return true;
 }
