@@ -85,6 +85,7 @@ ScreenRecEditor::ScreenRecEditor (ScreenRecProcessor& p)
     areas[aClicks]   = { 256, 689, 170, 44 };
     areas[aStatus]   = { 66, 830, 1012, 82 };
     areas[aHelp]     = { 1418, 64, 44, 44 };
+    areas[aEye]      = { 1362, 64, 44, 44 };
 
     addChildComponent (flash);
     flash.setInterceptsMouseClicks (false, false);
@@ -523,6 +524,39 @@ void ScreenRecEditor::paint (juce::Graphics& g)
         g.drawText ("?", r.translated (0, -1.0f), juce::Justification::centred);
     }
 
+    // ---- eye: show this window in the video
+    {
+        const auto r = areas[aEye];
+        const bool on = processor.showPluginInVideo;
+        g.setColour (juce::Colours::black.withAlpha (0.35f));
+        g.fillEllipse (r.translated (0, 1.5f));
+        juce::ColourGradient grad (juce::Colour (0xff3a3936), r.getX(), r.getY(), juce::Colour (0xff161616), r.getX(), r.getBottom(), false);
+        g.setGradientFill (grad);
+        g.fillEllipse (r.reduced (1.0f));
+
+        if (on)
+        {
+            g.setColour (amber.withAlpha (0.22f));
+            g.fillEllipse (r.expanded (5.0f));
+        }
+
+        const auto c = r.getCentre();
+        const juce::Colour ink = on ? amber : (hover == aEye ? amber.withAlpha (0.8f) : juce::Colour (0xffcfc6b8).withAlpha (0.85f));
+        g.setColour (ink);
+        g.drawEllipse (r.reduced (1.5f), 1.5f);
+
+        juce::Path eye;
+        eye.startNewSubPath (c.x - 13, c.y);
+        eye.quadraticTo (c.x, c.y - 11, c.x + 13, c.y);
+        eye.quadraticTo (c.x, c.y + 11, c.x - 13, c.y);
+        eye.closeSubPath();
+        g.strokePath (eye, juce::PathStrokeType (2.0f));
+        g.fillEllipse (c.x - 4.0f, c.y - 4.0f, 8.0f, 8.0f);
+
+        if (! on)
+            g.drawLine (c.x - 12, c.y + 10, c.x + 12, c.y - 10, 2.0f);   // crossed out
+    }
+
     if (helpOpen)
         drawHelp (g);
 }
@@ -550,13 +584,14 @@ void ScreenRecEditor::drawHelp (juce::Graphics& g) const
         { "EXTRAS", 1 },
         { "PAUSE: left out of the file.   DUCK: music -10 dB under your voice.", 2 },
         { "CLICKS: ripples on clicks.   Crashed recordings are recovered on reopen.", 2 },
+        { "EYE (top): show this window in the video, for tutorials about ScreenRec.", 2 },
     };
 
     // dim everything, then a dark glass card
     g.setColour (juce::Colours::black.withAlpha (0.55f));
     g.fillRect (juce::Rectangle<float> (0, 0, skinW, skinH));
 
-    const juce::Rectangle<float> card (150, 120, 1236, 800);
+    const juce::Rectangle<float> card (150, 100, 1236, 862);
     g.setColour (juce::Colour (0xf20d0d0d));
     g.fillRoundedRectangle (card, 14.0f);
     g.setColour (amber.withAlpha (0.7f));
@@ -685,6 +720,11 @@ void ScreenRecEditor::mouseUp (const juce::MouseEvent& e)
     switch (areaAt (toSkin (e.position)))
     {
         case aHelp:    helpOpen = true; break;
+        case aEye:
+            processor.showPluginInVideo = ! processor.showPluginInVideo;
+            showTemporaryStatus (processor.showPluginInVideo ? "This window WILL appear in the video"
+                                                             : "This window is hidden from the video");
+            break;
         case aRec:
             if (state == Recorder::State::recording)       recorder.stop();
             else if (state == Recorder::State::starting)   recorder.stop();   // cancels the countdown
@@ -755,7 +795,7 @@ void ScreenRecEditor::timerCallback()
         startTimer (33);
     }
 
-    updateCaptureExclusion (! (recorder.isSyncTest() && recorder.isBusy()));
+    updateCaptureExclusion (! (recorder.isSyncTest() && recorder.isBusy()) && ! processor.showPluginInVideo);
 
     // ---- VU (mic, after the knob): peak dBFS + 12 -> VU scale, ~300 ms ballistics
     {

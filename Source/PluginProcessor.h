@@ -36,6 +36,10 @@ public:
     Recorder recorder;
     std::unique_ptr<FrameOverlay> overlay;   // created by the editor (message thread)
 
+    // Eye button: show this plugin's window in the video (for tutorials about
+    // ScreenRec itself). Never saved: every new instance starts hidden.
+    bool showPluginInVideo = false;
+
 private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ScreenRecProcessor)
 };
