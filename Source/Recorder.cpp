@@ -512,11 +512,11 @@ void Recorder::probeEncoder()
         const auto probeLog = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("screenrec_probe.log");
         probeLog.deleteFile();
 
-        for (auto enc : {
+        for (auto enc : { "h264_nvenc", "h264_amf", "h264_qsv" })
+        {
             if (shuttingDown.load())
                 break;
- "h264_nvenc", "h264_amf", "h264_qsv" })
-        {
+
             juce::StringArray args { "-hide_banner", "-loglevel", "error", "-f", "lavfi",
                                      "-i", "color=c=black:s=1920x1080:r=30", "-frames:v", "15" };
             args.addArray (videoEncoderArgs (enc));
