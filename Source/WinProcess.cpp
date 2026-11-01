@@ -49,21 +49,56 @@ bool WinProcess::start (const std::wstring& commandLine, bool withStdin, const s
         childStdinRead = CreateFileW (L"NUL", GENERIC_READ, FILE_SHARE_READ, &sa, OPEN_EXISTING, 0, nullptr);
     }
 
-    STARTUPINFOW si {};
-    si.cb = sizeof (si);
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    si.hStdInput  = childStdinRead;
-    si.hStdOutput = log;
-    si.hStdError  = log;
+    STARTUPINFOEXW six {};
+    six.StartupInfo.cb = sizeof (six);
+    six.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    six.StartupInfo.wShowWindow = SW_HIDE;
+    six.StartupInfo.hStdInput  = childStdinRead;
+    six.StartupInfo.hStdOutput = log;
+    six.StartupInfo.hStdError  = log;
+
+    // Let ffmpeg inherit ONLY its own stdin/log handles. Without this list the
+    // child inherits every inheritable handle in the host (Cubase), which can
+    // keep host files/devices busy and make the host hang while closing.
+    HANDLE inheritList[2] = { childStdinRead, log };
+    const DWORD inheritCount = (childStdinRead == log) ? 1 : 2;
+    std::vector<char> attrBuf;
+    bool haveAttrList = false;
+    {
+        SIZE_T size = 0;
+        InitializeProcThreadAttributeList (nullptr, 1, 0, &size);
+        attrBuf.resize (size);
+        auto* list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST> (attrBuf.data());
+
+        if (size > 0 && InitializeProcThreadAttributeList (list, 1, 0, &size))
+        {
+            if (UpdateProcThreadAttribute (list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                           inheritList, inheritCount * sizeof (HANDLE), nullptr, nullptr))
+            {
+                six.lpAttributeList = list;
+                haveAttrList = true;
+            }
+            else
+            {
+                DeleteProcThreadAttributeList (list);
+            }
+        }
+    }
+
+    if (! haveAttrList)
+        six.StartupInfo.cb = sizeof (STARTUPINFOW);   // plain start-up info (no inherit list)
 
     PROCESS_INFORMATION pi {};
     std::vector<wchar_t> cmd (commandLine.begin(), commandLine.end());
     cmd.push_back (0);
 
     const BOOL ok = CreateProcessW (nullptr, cmd.data(), nullptr, nullptr, TRUE,
-                                    CREATE_NO_WINDOW,
-                                    nullptr, nullptr, &si, &pi);
+                                    CREATE_NO_WINDOW | (haveAttrList ? EXTENDED_STARTUPINFO_PRESENT : 0),
+                                    nullptr, nullptr,
+                                    &six.StartupInfo, &pi);
+
+    if (haveAttrList)
+        DeleteProcThreadAttributeList (six.lpAttributeList);
 
     if (childStdinRead != nullptr && childStdinRead != INVALID_HANDLE_VALUE)
         CloseHandle (childStdinRead);
@@ -149,17 +184,24 @@ void WinProcess::kill()
     }
 }
 
-int runProcessAndWait (const std::wstring& commandLine, const std::wstring& logFilePath, int timeoutMs)
+int runProcessAndWait (const std::wstring& commandLine, const std::wstring& logFilePath, int timeoutMs,
+                       const std::atomic<bool>* cancel)
 {
     WinProcess p;
 
     if (! p.start (commandLine, false, logFilePath))
         return -1;
 
-    if (! p.waitForExit (timeoutMs))
+    // Wait in short slices so a cancel (host closing) never has to sit out the full timeout.
+    const ULONGLONG deadline = GetTickCount64() + (ULONGLONG) timeoutMs;
+
+    while (! p.waitForExit (50))
     {
-        p.kill();
-        return -1;
+        if ((cancel != nullptr && cancel->load()) || GetTickCount64() >= deadline)
+        {
+            p.kill();
+            return -1;
+        }
     }
 
     return p.exitCode();
@@ -175,6 +217,6 @@ bool WinProcess::waitForExit (int) { return true; }
 int  WinProcess::exitCode() const { return code; }
 bool WinProcess::isRunning() const { return false; }
 void WinProcess::kill() {}
-int runProcessAndWait (const std::wstring&, const std::wstring&, int) { return -1; }
+int runProcessAndWait (const std::wstring&, const std::wstring&, int, const std::atomic<bool>*) { return -1; }
 
 #endif

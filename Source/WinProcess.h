@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <cstddef>
+#include <atomic>
 
 // Minimal child process with a writable stdin pipe and stderr/stdout sent to a
 // log file. Runs hidden (no console window). Used to drive ffmpeg.exe.
@@ -33,5 +34,7 @@ private:
 };
 
 // Runs a command to completion (hidden). Returns the exit code, or -1 on
-// failure / timeout (the process is killed on timeout).
-int runProcessAndWait (const std::wstring& commandLine, const std::wstring& logFilePath, int timeoutMs);
+// failure / timeout / cancel (the process is killed on timeout or cancel).
+// If 'cancel' becomes true while waiting, the child is killed right away.
+int runProcessAndWait (const std::wstring& commandLine, const std::wstring& logFilePath, int timeoutMs,
+                       const std::atomic<bool>* cancel = nullptr);

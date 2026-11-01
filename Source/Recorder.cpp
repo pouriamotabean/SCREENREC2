@@ -48,26 +48,52 @@ Recorder::Recorder()
 
 Recorder::~Recorder()
 {
+    shutdownLog ("---- closing ScreenRec " JucePlugin_VersionString ", state " + juce::String ((int) state.load()));
+
+    // Cancel the encoder probe and any automatic recovery first: both may be
+    // waiting on an ffmpeg child and must never hold up the host's shutdown.
+    shuttingDown = true;
     stopTimer();
+
+    if (probeThread.joinable())
+        probeThread.join();
+    shutdownLog ("probe stopped");
+
     joinWorker();
+    shutdownLog ("worker stopped");
 
     if (state.load() == State::recording)
     {
         // Host is closing the plugin mid-recording: finish the file synchronously.
+        shutdownLog ("was recording - saving the file");
         state = State::saving;
         runFinish();
+        shutdownLog ("file saved");
     }
 
     joinWorker();
-
-    if (probeThread.joinable())
-        probeThread.join();
 
     if (drainThread.joinable())
     {
         drainRunning = false;
         drainThread.join();
     }
+
+    shutdownLog ("closed");
+}
+
+void Recorder::shutdownLog (const juce::String& s)
+{
+    // One small file showing where a slow close got stuck (rewritten on each close).
+    const auto f = getOutputFolder().getChildFile ("logs").getChildFile ("close.log");
+    if (s.startsWith ("----"))
+    {
+        f.getParentDirectory().createDirectory();
+        f.replaceWithText ({});
+    }
+    f.appendText (juce::Time::getCurrentTime().formatted ("[%H:%M:%S.")
+                  + juce::String (juce::Time::getCurrentTime().getMilliseconds()).paddedLeft ('0', 3) + "]  "
+                  + s + "\r\n", false, false, "\r\n");
 }
 
 void Recorder::joinWorker()
@@ -242,7 +268,7 @@ void Recorder::processAudio (juce::AudioBuffer<float>& buffer, const juce::Audio
 
 void Recorder::warmUp()
 {
-    if (encoderReady.load() || probeThread.joinable())
+    if (encoderReady.load() || probeThread.joinable() || shuttingDown.load())
         return;
 
     probeThread = std::thread ([this] { probeEncoder(); });
@@ -486,14 +512,17 @@ void Recorder::probeEncoder()
         const auto probeLog = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("screenrec_probe.log");
         probeLog.deleteFile();
 
-        for (auto enc : { "h264_nvenc", "h264_amf", "h264_qsv" })
+        for (auto enc : {
+            if (shuttingDown.load())
+                break;
+ "h264_nvenc", "h264_amf", "h264_qsv" })
         {
             juce::StringArray args { "-hide_banner", "-loglevel", "error", "-f", "lavfi",
                                      "-i", "color=c=black:s=1920x1080:r=30", "-frames:v", "15" };
             args.addArray (videoEncoderArgs (enc));
             args.addArray ({ "-f", "null", "-" });
 
-            if (runProcessAndWait (buildCommand (args), toWide (probeLog.getFullPathName()), 20000) == 0)
+            if (runProcessAndWait (buildCommand (args), toWide (probeLog.getFullPathName()), 20000, &shuttingDown) == 0)
             {
                 chosen = enc;
                 break;
@@ -891,7 +920,19 @@ void Recorder::produceOutput (int64_t t0, int64_t frames, const std::vector<floa
         args.add ("-shortest");
     args.addArray ({ "-movflags", "+faststart", sessionOutput.getFullPathName() });
 
-    const int code = runProcessAndWait (buildCommand (args), toWide (sessionLog.getFullPathName()), 60 * 60 * 1000);
+    // A normal save is never cancelled. An automatic recovery is: if the host
+    // closes meanwhile it stops and simply runs again the next time.
+    const int code = runProcessAndWait (buildCommand (args), toWide (sessionLog.getFullPathName()), 60 * 60 * 1000,
+                                        recovered ? &shuttingDown : nullptr);
+
+    if (recovered && shuttingDown.load())
+    {
+        sessionOutput.deleteFile();
+        log ("recovery paused: plugin closing (will continue next time)");
+        state = State::idle;
+        anyInstanceBusy = false;
+        return;
+    }
 
     if (code != 0 || ! sessionOutput.existsAsFile())
     {
@@ -1617,7 +1658,7 @@ bool Recorder::repairWavHeader (const juce::File& wav)
 
 void Recorder::checkForRecovery()
 {
-    if (isBusy())
+    if (isBusy() || shuttingDown.load())
         return;
 
     const auto tempRoot = getOutputFolder().getChildFile (".temp");
@@ -1722,8 +1763,15 @@ void Recorder::runRecovery (juce::File dir)
         return;
     }
 
+    if (shuttingDown.load())
+    {
+        state = State::idle;
+        anyInstanceBusy = false;
+        return;
+    }
+
     produceOutput (t0, frames, {}, true);
 
-    if (state.load() == State::error)
+    if (state.load() == State::error && ! shuttingDown.load())
         dir.getChildFile ("recovery_failed").create();
 }

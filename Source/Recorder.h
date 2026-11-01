@@ -126,6 +126,7 @@ private:
     void setStatus (const juce::String& s);
     void fail (const juce::String& s);
     void log (const juce::String& s);
+    static void shutdownLog (const juce::String& s);
 
     juce::File findFfmpeg() const;
     juce::StringArray videoEncoderArgs (const juce::String& encoder, int kbps = 8000) const;
@@ -176,6 +177,7 @@ private:
     std::atomic<int> currentBlockSize { 512 };
     std::atomic<int64_t> captureStartTicks { 0 };
     std::atomic<bool> stopRequested { false };
+    std::atomic<bool> shuttingDown { false };      // host is destroying the plugin: cancel probe/recovery, never block
 
     // Lock-free audio FIFO (interleaved stereo float).
     std::unique_ptr<juce::AbstractFifo> audioFifo;
